@@ -69,10 +69,19 @@
 
     /* ─── Inicia ─── */
     document.addEventListener('DOMContentLoaded', () => {
-        carregarTudo().then(() => {
-            popularSelects();
-        });
+        mostrarLoading(false);
+        if (sessionStorage.getItem('logado') === 'sim') {
+            document.getElementById('login-screen').style.display = 'none';
+            carregarTudo().then(() => popularSelects());
+        } else {
+            document.getElementById('login-screen').style.display = 'flex';
+        }
     });
+
+    window._iniciarApp = function() {
+        document.getElementById('login-screen').style.display = 'none';
+        carregarTudo().then(() => popularSelects());
+    };
     </script>
 
     <style>
@@ -86,6 +95,30 @@
         }
         * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
         body { font-family: 'DM Sans', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+
+        /* LOGIN */
+        #login-screen {
+            position: fixed; inset: 0; background: linear-gradient(135deg, #1e3a8a 0%, #1d4ed8 60%, #3b82f6 100%);
+            display: none; flex-direction: column; align-items: center; justify-content: center;
+            z-index: 1000; padding: 24px;
+        }
+        .login-box {
+            background: white; border-radius: 20px; padding: 32px 28px;
+            width: 100%; max-width: 360px; box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        .login-logo { text-align: center; margin-bottom: 24px; }
+        .login-logo .icon { font-size: 2.8rem; }
+        .login-logo h1 { font-size: 1.1rem; font-weight: 700; color: #1d4ed8; margin-top: 8px; }
+        .login-logo p  { font-size: 0.8rem; color: #64748b; margin-top: 4px; }
+        .login-field { margin-bottom: 14px; }
+        .login-field label { display: block; font-size: 0.75rem; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+        .login-field input { width: 100%; padding: 12px 14px; border: 1.5px solid #e2e8f0; border-radius: 10px; font-family: 'DM Sans', sans-serif; font-size: 1rem; outline: none; transition: border-color 0.15s; }
+        .login-field input:focus { border-color: #1d4ed8; box-shadow: 0 0 0 3px rgba(29,78,216,0.1); }
+        .login-erro { background: #fff0f0; color: #dc2626; border: 1px solid #fecaca; border-radius: 8px; padding: 10px 14px; font-size: 0.85rem; margin-bottom: 12px; display: none; text-align: center; }
+        .login-btn { width: 100%; padding: 13px; background: #1d4ed8; color: white; border: none; border-radius: 10px; font-family: 'DM Sans', sans-serif; font-size: 1rem; font-weight: 700; cursor: pointer; transition: background 0.18s; margin-top: 4px; }
+        .login-btn:active { background: #1e3a8a; }
+        .login-rodape { text-align: center; margin-top: 20px; font-size: 0.75rem; color: rgba(255,255,255,0.6); }
 
         /* HEADER */
         header { background: var(--primary); height: 58px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 12px rgba(29,78,216,0.3); }
@@ -228,6 +261,29 @@
     </style>
 </head>
 <body>
+
+<!-- TELA DE LOGIN -->
+<div id="login-screen">
+    <div class="login-box">
+        <div class="login-logo">
+            <div class="icon">🛒</div>
+            <h1>Controle de Vendas</h1>
+            <p>Faça login para continuar</p>
+        </div>
+        <div class="login-field">
+            <label>Usuário</label>
+            <input type="text" id="login-user" placeholder="Digite o usuário" autocomplete="username" onkeydown="if(event.key==='Enter')document.getElementById('login-senha').focus()">
+        </div>
+        <div class="login-field">
+            <label>Senha</label>
+            <input type="password" id="login-senha" placeholder="Digite a senha" autocomplete="current-password" onkeydown="if(event.key==='Enter')fazerLogin()">
+        </div>
+        <div class="login-erro" id="login-erro">Usuário ou senha incorretos</div>
+        <button class="login-btn" onclick="fazerLogin()">Entrar</button>
+    </div>
+    <p class="login-rodape">Acesso restrito</p>
+</div>
+
 
 <!-- LOADING -->
 <div id="loading-overlay">
@@ -379,6 +435,33 @@
 /* ══════════════════════════════════════
    UTILS
 ══════════════════════════════════════ */
+/* ══════════════════════════════════════
+   LOGIN
+══════════════════════════════════════ */
+/* ▼▼▼ ALTERE AQUI os usuários e senhas ▼▼▼ */
+const USUARIOS = {
+    'madeireira':    'madtibolla',
+    'william':  'vendas123',
+    'usuario2': 'senha456'
+};
+/* ▲▲▲ fim dos usuários ▲▲▲ */
+
+function fazerLogin() {
+    const user  = document.getElementById('login-user').value.trim().toLowerCase();
+    const senha = document.getElementById('login-senha').value;
+    const erro  = document.getElementById('login-erro');
+    if (USUARIOS[user] && USUARIOS[user] === senha) {
+        sessionStorage.setItem('logado', 'sim');
+        sessionStorage.setItem('usuario', user);
+        erro.style.display = 'none';
+        window._iniciarApp();
+    } else {
+        erro.style.display = 'block';
+        document.getElementById('login-senha').value = '';
+        document.getElementById('login-senha').focus();
+    }
+}
+
 function fmtR(v) { return (v||0).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2}); }
 
 function toast(msg, dur=2500) {
