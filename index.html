@@ -335,6 +335,11 @@
             <div class="card-menu" onclick="navegar('relatorios')"><span class="icon">📊</span>Fichas</div>
             <div class="card-menu arquivadas" onclick="navegar('fichas-arquivadas')"><span class="icon">🗄️</span>Arquivadas</div>
         </div>
+        <div class="acoes-bar no-print">
+            <button class="btn-secondary" style="font-size:0.78rem;padding:9px 6px;" onclick="exportarDados()">📥 Exportar Backup</button>
+            <button class="btn-secondary" style="font-size:0.78rem;padding:9px 6px;" onclick="document.getElementById('import-file').click()">📤 Importar Backup</button>
+            <input type="file" id="import-file" accept=".json" style="display:none" onchange="importarDados(event)">
+        </div>
     </div>
 
     <!-- NOVA VENDA -->
@@ -376,7 +381,7 @@
                 <select id="pag-forma">
                     <option value="Dinheiro">💵 Dinheiro</option>
                     <option value="PIX">⚡ PIX</option>
-                    <option value="Cartão">💳 Cartão</option>
+                    <option value="Cheque">🏷️ Cheque</option>
                     <option value="Transferência">🏦 Transferência</option>
                 </select>
             </div>
@@ -440,7 +445,7 @@
 ══════════════════════════════════════ */
 /* ▼▼▼ ALTERE AQUI os usuários e senhas ▼▼▼ */
 const USUARIOS = {
-    'madeireira':    'madtibolla',
+    'admin':    'vendas123',
     'william':  'vendas123',
     'usuario2': 'senha456'
 };
@@ -868,6 +873,64 @@ function renderListaProdutos(){
     const lista=db().produtos.filter(p=>p.nome.toLowerCase().includes(busca)||(p.cod||'').includes(busca)).sort((a,b)=>a.nome.localeCompare(b.nome));
     if(lista.length===0){cont.innerHTML=`<div class="empty-state"><div class="icon">📦</div><p>Nenhum produto encontrado.</p></div>`;return;}
     cont.innerHTML=lista.map(p=>`<div class="item-cadastro"><div class="item-cadastro-info"><strong>${p.nome}</strong><small>Cód: ${p.cod||'—'}</small></div><div style="display:flex;gap:6px;"><button class="btn-icon" onclick="editarProduto('${p._id}')">✏️</button><button class="btn-icon" onclick="excluirProduto('${p._id}')">🗑️</button></div></div>`).join('');
+}
+
+/* ══════════════════════════════════════
+   BACKUP MANUAL
+══════════════════════════════════════ */
+function exportarDados() {
+    const dados = JSON.stringify(window._db, null, 2);
+    const blob  = new Blob([dados], { type: 'application/json' });
+    const url   = URL.createObjectURL(blob);
+    const a     = document.createElement('a');
+    a.href      = url;
+    a.download  = `backup-vendas-${new Date().toLocaleDateString('pt-BR').replace(/\//g,'-')}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('📥 Backup exportado!');
+}
+
+async function importarDados(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async e => {
+        try {
+            const dados = JSON.parse(e.target.result);
+            if (!dados.clientes || !dados.vendas) return toast('⚠️ Arquivo inválido');
+            if (!confirm('Importar backup? Os dados serão adicionados ao banco atual.')) return;
+            mostrarLoading(true);
+            for (const c of (dados.clientes||[])) {
+                const {_id, ...d} = c;
+                const id = await fs().inserir('clientes', d);
+                window._db.clientes.push({_id: id, ...d});
+            }
+            for (const p of (dados.produtos||[])) {
+                const {_id, ...d} = p;
+                const id = await fs().inserir('produtos', d);
+                window._db.produtos.push({_id: id, ...d});
+            }
+            for (const v of (dados.vendas||[])) {
+                const {_id, ...d} = v;
+                const id = await fs().inserir('vendas', d);
+                window._db.vendas.push({_id: id, ...d});
+            }
+            for (const pg of (dados.pagos||[])) {
+                const {_id, ...d} = pg;
+                const id = await fs().inserir('pagamentos', d);
+                window._db.pagos.push({_id: id, ...d});
+            }
+            mostrarLoading(false);
+            atualizarHome();
+            renderGrafico();
+            toast('✅ Backup importado com sucesso!');
+        } catch(err) {
+            mostrarLoading(false);
+            toast('❌ Erro ao importar arquivo');
+        }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
 }
 </script>
 </body>
