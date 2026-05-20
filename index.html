@@ -11,9 +11,11 @@
     <script type="module">
     import { initializeApp }                      from "https://www.gstatic.com/firebasejs/12.11.0/firebase-app.js";
     import { getFirestore, collection, doc,
-             getDocs, addDoc, updateDoc, deleteDoc,
-             onSnapshot, query, orderBy, writeBatch,
-             serverTimestamp }                    from "https://www.gstatic.com/firebasejs/12.11.0/firebase-firestore.js";
+             getDoc, getDocs, addDoc, updateDoc, deleteDoc,
+             onSnapshot, query, where, orderBy, limit,
+             writeBatch, serverTimestamp }       from "https://www.gstatic.com/firebasejs/12.11.0/firebase-firestore.js";
+    import { getAuth, signInWithEmailAndPassword, signOut,
+             onAuthStateChanged }                from "https://www.gstatic.com/firebasejs/12.11.0/firebase-auth.js";
 
     const firebaseConfig = {
         apiKey:            "AIzaSyBiu0GO41Qnj-157w5QjbOR9YXcV1Gkx3E",
@@ -24,27 +26,92 @@
         appId:             "1:228628888432:web:eeddf397fe759ca430edb5"
     };
 
-    const app = initializeApp(firebaseConfig);
-    const db  = getFirestore(app);
+    const app  = initializeApp(firebaseConfig);
+    const db   = getFirestore(app);
+    const auth = getAuth(app);
 
     const col = name => collection(db, name);
+
+    // Usuário atualmente autenticado (perfil + papel)
+    window._usuario = null;
 
     async function listar(nome) {
         const snap = await getDocs(col(nome));
         return snap.docs.map(d => ({ _id: d.id, ...d.data() }));
     }
     async function inserir(nome, dados) {
-        const ref = await addDoc(col(nome), { ...dados, _ts: serverTimestamp() });
+        const ref = await addDoc(col(nome), {
+            ...dados,
+            _ts: serverTimestamp(),
+            criado_por_uid:   window._usuario?.uid   || null,
+            criado_por_email: window._usuario?.email || null,
+            criado_por_nome:  window._usuario?.nome  || null
+        });
+        await auditar('criar', nome, ref.id, { dados });
         return ref.id;
     }
     async function atualizar(nome, id, dados) {
-        await updateDoc(doc(db, nome, id), dados);
+        await updateDoc(doc(db, nome, id), {
+            ...dados,
+            atualizado_em:      serverTimestamp(),
+            atualizado_por_uid: window._usuario?.uid   || null,
+            atualizado_por_email: window._usuario?.email || null,
+            atualizado_por_nome:  window._usuario?.nome  || null
+        });
+        await auditar('atualizar', nome, id, { dados });
     }
+    // Mantemos a função "excluir" para casos pontuais (admin), mas o app passa
+    // a usar "cancelar" (soft delete) como padrão.
     async function excluir(nome, id) {
+        await auditar('excluir_fisico', nome, id, {});
         await deleteDoc(doc(db, nome, id));
+    }
+    async function cancelar(nome, id, motivo) {
+        await updateDoc(doc(db, nome, id), {
+            cancelado: true,
+            cancelado_em:    serverTimestamp(),
+            cancelado_por_uid: window._usuario?.uid   || null,
+            cancelado_por_email: window._usuario?.email || null,
+            cancelado_por_nome:  window._usuario?.nome  || null,
+            cancelado_motivo: motivo || null
+        });
+        await auditar('cancelar', nome, id, { motivo });
+    }
+
+    // Registra entrada no log de auditoria. Nunca lança erro pra não travar fluxo.
+    async function auditar(acao, colecao, doc_id, dados) {
+        try {
+            await addDoc(col('auditoria'), {
+                acao, colecao, doc_id,
+                dados: dados || {},
+                usuario_uid:   window._usuario?.uid   || null,
+                usuario_email: window._usuario?.email || null,
+                usuario_nome:  window._usuario?.nome  || null,
+                timestamp: serverTimestamp(),
+                user_agent: navigator.userAgent || null
+            });
+        } catch(e) {
+            console.warn('Falha ao gravar auditoria', e);
+        }
     }
 
     window._db = { clientes: [], produtos: [], vendas: [], pagos: [], descontos: [] };
+
+    async function carregarPerfil(user) {
+        // Busca o documento usuarios/{uid} para descobrir nome e papel.
+        const snap = await getDoc(doc(db, 'usuarios', user.uid));
+        if (!snap.exists()) {
+            return null; // sem perfil = sem acesso
+        }
+        const dados = snap.data();
+        if (dados.ativo === false) return null;
+        return {
+            uid:   user.uid,
+            email: user.email,
+            nome:  dados.nome  || user.email,
+            papel: dados.papel || 'vendedor'
+        };
+    }
 
     async function carregarTudo() {
         mostrarLoading(true);
@@ -52,32 +119,71 @@
             listar('clientes'), listar('produtos'),
             listar('vendas'),   listar('pagamentos'), listar('descontos')
         ]);
-        window._db.clientes  = cli;
-        window._db.produtos  = prod;
-        window._db.vendas    = vnd;
-        window._db.pagos     = pag;
-        window._db.descontos = desc;
+        // Filtra cancelados (soft-deleted)
+        const ativo = arr => arr.filter(x => x.cancelado !== true);
+        window._db.clientes  = ativo(cli);
+        window._db.produtos  = ativo(prod);
+        window._db.vendas    = ativo(vnd);
+        window._db.pagos     = ativo(pag);
+        window._db.descontos = ativo(desc);
         mostrarLoading(false);
         atualizarHome();
         renderGrafico();
+        atualizarHeaderUsuario();
     }
 
-    window._fs = { listar, inserir, atualizar, excluir, carregarTudo };
+    async function fazerLoginAuth(email, senha) {
+        // Lança erro em caso de credencial inválida — tratado pelo chamador
+        const cred = await signInWithEmailAndPassword(auth, email, senha);
+        return cred.user;
+    }
 
-    document.addEventListener('DOMContentLoaded', () => {
-        mostrarLoading(false);
-        if (sessionStorage.getItem('logado') === 'sim') {
+    async function logoutApp() {
+        try { await auditar('logout', 'sessao', null, {}); } catch(e) {}
+        await signOut(auth);
+        window._usuario = null;
+        window._db = { clientes: [], produtos: [], vendas: [], pagos: [], descontos: [] };
+        // recarrega a página para garantir reset total da memória
+        location.reload();
+    }
+
+    window._fs = {
+        listar, inserir, atualizar, excluir, cancelar, auditar,
+        carregarTudo, fazerLoginAuth, logoutApp, carregarPerfil
+    };
+
+    // Observa estado de autenticação
+    onAuthStateChanged(auth, async (user) => {
+        if (user) {
+            const perfil = await carregarPerfil(user);
+            if (!perfil) {
+                // usuário autenticado mas sem perfil ou inativo
+                await signOut(auth);
+                document.getElementById('login-erro').innerText = 'Acesso não autorizado. Contate o administrador.';
+                document.getElementById('login-erro').style.display = 'block';
+                document.getElementById('login-screen').style.display = 'flex';
+                mostrarLoading(false);
+                return;
+            }
+            window._usuario = perfil;
+            try { await auditar('login', 'sessao', null, {}); } catch(e) {}
             document.getElementById('login-screen').style.display = 'none';
-            carregarTudo().then(() => popularSelects());
+            await carregarTudo();
+            popularSelects();
+            atualizarHeaderUsuario();
+            aplicarPermissoes();
         } else {
+            window._usuario = null;
             document.getElementById('login-screen').style.display = 'flex';
+            mostrarLoading(false);
         }
     });
 
-    window._iniciarApp = function() {
-        document.getElementById('login-screen').style.display = 'none';
-        carregarTudo().then(() => popularSelects());
-    };
+    document.addEventListener('DOMContentLoaded', () => {
+        mostrarLoading(true);
+        // O onAuthStateChanged dispara automaticamente. Se não houver usuário,
+        // exibe a tela de login.
+    });
     </script>
 
     <style>
@@ -119,7 +225,14 @@
         header { background: var(--primary); height: 58px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 12px rgba(29,78,216,0.3); }
         .btn-voltar { background: rgba(255,255,255,0.15); border: none; color: white; padding: 7px 14px; border-radius: 8px; font-family: 'DM Sans', sans-serif; font-weight: 600; font-size: 0.8rem; cursor: pointer; display: none; }
         #titulo-tela { color: white; font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; text-align: center; flex: 1; }
-        .header-right { width: 80px; display: flex; justify-content: flex-end; }
+        .header-right { width: 80px; display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
+        .btn-sair { background: rgba(255,255,255,0.15); border: none; color: white; width: 36px; height: 36px; border-radius: 50%; font-size: 1.1rem; cursor: pointer; transition: background 0.15s; }
+        .btn-sair:active { background: rgba(255,255,255,0.3); }
+        .user-bar { background: #eff6ff; border-bottom: 1px solid #dbeafe; padding: 5px 16px; font-size: 0.72rem; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; }
+        .user-bar-papel { background: var(--primary); color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+        .user-bar-papel.admin { background: #7c3aed; }
+        .user-bar-papel.vendedor { background: #0ea5e9; }
+        .somente-admin { /* controlado via JS */ }
 
         /* LOADING OVERLAY */
         #loading-overlay { position: fixed; inset: 0; background: rgba(30,64,175,0.85); display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 999; transition: opacity 0.3s; }
@@ -208,6 +321,32 @@
         .item-cadastro-info { font-size: 0.87rem; }
         .item-cadastro-info strong { display: block; margin-bottom: 2px; }
         .item-cadastro-info small { color: var(--text-muted); font-size: 0.75rem; }
+
+        /* FICHAS — lista alfabética */
+        .item-ficha { background: white; padding: 12px 14px; border-radius: 10px; border: 1.5px solid var(--border); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; cursor: pointer; transition: all 0.15s; }
+        .item-ficha:active { transform: scale(0.99); border-color: var(--primary); background: var(--primary-light); }
+        .item-ficha.selecionado { border-color: var(--primary); background: var(--primary-light); }
+        .item-ficha.sem-ficha { background: #f8fafc; border-style: dashed; opacity: 0.85; }
+        .item-ficha.sem-ficha .item-ficha-info strong { color: var(--text-muted); font-weight: 500; }
+        .item-ficha-info { flex: 1; min-width: 0; }
+        .item-ficha-info strong { display: block; font-size: 0.92rem; color: var(--text); margin-bottom: 2px; }
+        .item-ficha-info small { display: block; color: var(--text-muted); font-size: 0.74rem; }
+        .item-ficha-saldo { font-family: 'DM Mono', monospace; font-weight: 700; font-size: 0.92rem; text-align: right; padding-left: 10px; white-space: nowrap; }
+        .saldo-devedor { color: var(--danger); }
+        .saldo-quitado { color: var(--success); }
+        .saldo-credito { color: var(--primary); }
+
+        /* AUDITORIA */
+        .aud-item { background: white; padding: 12px 14px; border-radius: 10px; border: 1.5px solid var(--border); margin-bottom: 8px; font-size: 0.85rem; }
+        .aud-item-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+        .aud-tag { color: white; padding: 2px 10px; border-radius: 99px; font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+        .aud-colecao { font-size: 0.74rem; color: var(--text-muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+        .aud-data { font-size: 0.74rem; color: var(--text-muted); margin-left: auto; font-family: 'DM Mono', monospace; }
+        .aud-usuario { font-size: 0.82rem; color: var(--text); margin-bottom: 3px; }
+        .aud-doc { font-size: 0.74rem; color: var(--text-muted); font-family: 'DM Mono', monospace; word-break: break-all; }
+        .aud-dados { margin-top: 6px; }
+        .aud-dados summary { cursor: pointer; font-size: 0.78rem; color: var(--primary); user-select: none; }
+        .aud-dados pre { background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-size: 0.72rem; margin-top: 5px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
 
         /* SEARCH */
         .search-bar { position: relative; margin-bottom: 12px; }
@@ -314,17 +453,17 @@
             <p>Faça login para continuar</p>
         </div>
         <div class="login-field">
-            <label>Usuário</label>
-            <input type="text" id="login-user" placeholder="Digite o usuário" autocomplete="username" onkeydown="if(event.key==='Enter')document.getElementById('login-senha').focus()">
+            <label>E-mail</label>
+            <input type="email" id="login-user" placeholder="seu@email.com" autocomplete="username" onkeydown="if(event.key==='Enter')document.getElementById('login-senha').focus()">
         </div>
         <div class="login-field">
             <label>Senha</label>
             <input type="password" id="login-senha" placeholder="Digite a senha" autocomplete="current-password" onkeydown="if(event.key==='Enter')fazerLogin()">
         </div>
-        <div class="login-erro" id="login-erro">Usuário ou senha incorretos</div>
-        <button class="login-btn" onclick="fazerLogin()">Entrar</button>
+        <div class="login-erro" id="login-erro">E-mail ou senha incorretos</div>
+        <button class="login-btn" id="btn-login" onclick="fazerLogin()">Entrar</button>
     </div>
-    <p class="login-rodape">Acesso restrito</p>
+    <p class="login-rodape">Acesso restrito · Madeireira Tibolla</p>
 </div>
 
 <!-- LOADING -->
@@ -336,8 +475,14 @@
 <header>
     <button class="btn-voltar" id="btnVoltar" onclick="navegar('dashboard')">◀ Voltar</button>
     <h2 id="titulo-tela">Controle de Vendas</h2>
-    <div class="header-right"></div>
+    <div class="header-right">
+        <button class="btn-sair" id="btnSair" onclick="confirmarSair()" title="Sair">↪</button>
+    </div>
 </header>
+<div class="user-bar" id="user-bar" style="display:none;">
+    <span id="user-bar-nome">—</span>
+    <span class="user-bar-papel" id="user-bar-papel">vendedor</span>
+</div>
 
 <div class="container">
 
@@ -377,6 +522,7 @@
             <div class="card-menu" onclick="navegar('cad-produto')"><span class="icon">📦</span>Produtos</div>
             <div class="card-menu" onclick="navegar('relatorios')"><span class="icon">📊</span>Fichas</div>
             <div class="card-menu arquivadas" onclick="navegar('fichas-arquivadas')"><span class="icon">🗄️</span>Arquivadas</div>
+            <div class="card-menu somente-admin" onclick="navegar('auditoria')" style="display:none;"><span class="icon">🔍</span>Auditoria</div>
         </div>
         <div class="acoes-bar no-print">
             <button class="btn-secondary" style="font-size:0.78rem;padding:9px 6px;" onclick="exportarDados()">📥 Exportar Backup</button>
@@ -496,20 +642,20 @@
 
     <!-- FICHAS -->
     <div id="relatorios" class="screen">
-        <!-- [NOVO] Busca por texto + select mantido -->
         <div class="card" style="margin-bottom:12px;padding:14px;">
             <div class="section-title" style="margin-top:0;">Buscar Cliente</div>
-            <div class="form-group" style="margin-bottom:10px;">
-                <div style="position:relative;">
-                    <input type="text" id="rel-busca-input" placeholder="🔍 Digite o nome do cliente..." oninput="filtrarClientesFicha()" autocomplete="off" style="padding-left:14px;">
-                    <div id="rel-busca-lista" class="rel-busca-lista" style="display:none;"></div>
-                </div>
+            <div class="form-group" style="margin-bottom:0;">
+                <input type="text" id="rel-busca-input" placeholder="🔍 Digite o nome do cliente..." oninput="renderListaFichas()" autocomplete="off" style="padding-left:14px;">
             </div>
-            <div class="form-group filtros" style="margin-bottom:0;">
-                <label style="margin-bottom:4px;">Ou selecione pela lista</label>
-                <select id="rel-cliente" onchange="selecionarClienteFichaSelect()"></select>
-            </div>
+            <select id="rel-cliente" style="display:none;"></select>
         </div>
+
+        <!-- Lista alfabética de fichas com saldos -->
+        <div id="lista-fichas-container">
+            <div class="section-title" id="lista-fichas-titulo" style="margin-top:0;">Fichas em Aberto</div>
+            <div id="lista-fichas"></div>
+        </div>
+
         <div id="area-impressao"></div>
     </div>
 
@@ -559,20 +705,47 @@
         <div id="lista-produtos"></div>
     </div>
 
-</div>
-
-<!-- MODAL SENHA EDIÇÃO -->
-<div id="modal-senha">
-    <div class="senha-box">
-        <h3>🔒 Confirme sua senha</h3>
-        <div class="senha-erro" id="senha-erro">Senha incorreta</div>
-        <div class="form-group">
-            <label>Senha</label>
-            <input type="password" id="senha-input" placeholder="Digite sua senha" onkeydown="if(event.key==='Enter')confirmarSenhaEdicao()">
+    <!-- AUDITORIA -->
+    <div id="auditoria" class="screen">
+        <div class="card" style="padding:14px;margin-bottom:12px;">
+            <div class="section-title" style="margin-top:0;">Filtros</div>
+            <div class="row-inputs" style="margin-bottom:8px;">
+                <div>
+                    <label>Ação</label>
+                    <select id="aud-acao" onchange="renderAuditoria()">
+                        <option value="">— Todas —</option>
+                        <option value="criar">Criar</option>
+                        <option value="atualizar">Atualizar</option>
+                        <option value="cancelar">Cancelar</option>
+                        <option value="excluir_fisico">Excluir físico</option>
+                        <option value="arquivar">Arquivar</option>
+                        <option value="login">Login</option>
+                        <option value="logout">Logout</option>
+                    </select>
+                </div>
+                <div>
+                    <label>Coleção</label>
+                    <select id="aud-colecao" onchange="renderAuditoria()">
+                        <option value="">— Todas —</option>
+                        <option value="clientes">Clientes</option>
+                        <option value="produtos">Produtos</option>
+                        <option value="vendas">Vendas</option>
+                        <option value="pagamentos">Pagamentos</option>
+                        <option value="descontos">Descontos</option>
+                        <option value="sessao">Sessão</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-group" style="margin-bottom:8px;">
+                <label>Usuário (e-mail ou nome)</label>
+                <input type="text" id="aud-usuario" placeholder="Filtrar por usuário..." oninput="renderAuditoria()">
+            </div>
+            <button class="btn-secondary" onclick="carregarAuditoria()">🔄 Recarregar</button>
         </div>
-        <button class="btn-primary" onclick="confirmarSenhaEdicao()">Confirmar</button>
-        <button class="btn-secondary" onclick="fecharModalSenha()" style="margin-top:8px;">Cancelar</button>
+        <div id="aud-resumo" style="font-size:0.8rem;color:var(--text-muted);margin-bottom:8px;"></div>
+        <div id="lista-auditoria"></div>
     </div>
+
 </div>
 
 <!-- MODAL EDIÇÃO DE LANÇAMENTOS -->
@@ -592,28 +765,83 @@
 
 <script>
 /* ══════════════════════════════════════
-   LOGIN
+   LOGIN / SESSÃO / PAPÉIS
 ══════════════════════════════════════ */
-const USUARIOS = {
-    'madeireira':    'madtibolla',
-    'william':  'vendas123',
-    'usuario2': 'senha456'
-};
-
-function fazerLogin() {
-    const user  = document.getElementById('login-user').value.trim().toLowerCase();
+async function fazerLogin() {
+    const email = document.getElementById('login-user').value.trim();
     const senha = document.getElementById('login-senha').value;
     const erro  = document.getElementById('login-erro');
-    if (USUARIOS[user] && USUARIOS[user] === senha) {
-        sessionStorage.setItem('logado', 'sim');
-        sessionStorage.setItem('usuario', user);
-        erro.style.display = 'none';
-        window._iniciarApp();
-    } else {
+    const btn   = document.getElementById('btn-login');
+    if (!email || !senha) {
+        erro.innerText = 'Informe e-mail e senha';
+        erro.style.display = 'block';
+        return;
+    }
+    erro.style.display = 'none';
+    btn.disabled = true;
+    btn.innerText = 'Entrando…';
+    try {
+        await fs().fazerLoginAuth(email, senha);
+        // onAuthStateChanged cuida do resto (carrega perfil, dados etc.)
+    } catch (e) {
+        console.warn(e);
+        let msg = 'E-mail ou senha incorretos';
+        if (e && e.code) {
+            if (e.code === 'auth/too-many-requests') msg = 'Muitas tentativas. Aguarde alguns minutos.';
+            else if (e.code === 'auth/network-request-failed') msg = 'Sem conexão com a internet.';
+            else if (e.code === 'auth/invalid-email') msg = 'E-mail inválido.';
+            else if (e.code === 'auth/user-disabled') msg = 'Usuário desativado.';
+        }
+        erro.innerText = msg;
         erro.style.display = 'block';
         document.getElementById('login-senha').value = '';
         document.getElementById('login-senha').focus();
+    } finally {
+        btn.disabled = false;
+        btn.innerText = 'Entrar';
     }
+}
+
+function confirmarSair() {
+    if (confirm('Encerrar sessão?')) {
+        fs().logoutApp();
+    }
+}
+
+function usuarioAtual() {
+    return window._usuario || null;
+}
+function ehAdmin() {
+    return usuarioAtual() && usuarioAtual().papel === 'admin';
+}
+function exigirAdmin() {
+    if (!ehAdmin()) {
+        toast('🔒 Ação restrita ao administrador');
+        return false;
+    }
+    return true;
+}
+
+function atualizarHeaderUsuario() {
+    const u = usuarioAtual();
+    const bar = document.getElementById('user-bar');
+    if (!u || !bar) {
+        if (bar) bar.style.display = 'none';
+        return;
+    }
+    bar.style.display = 'flex';
+    document.getElementById('user-bar-nome').innerText = '👤 ' + u.nome;
+    const papelEl = document.getElementById('user-bar-papel');
+    papelEl.innerText = u.papel;
+    papelEl.className = 'user-bar-papel ' + u.papel;
+}
+
+function aplicarPermissoes() {
+    // Mostra/oculta itens visíveis somente para admin
+    const display = ehAdmin() ? '' : 'none';
+    document.querySelectorAll('.somente-admin').forEach(el => {
+        el.style.display = display;
+    });
 }
 
 /* ══════════════════════════════════════
@@ -697,6 +925,11 @@ function obterSaldo(cid) {
 let itensAtuais=[];
 
 function navegar(tela) {
+    // Bloqueia tela de auditoria para não-admin
+    if (tela === 'auditoria' && !ehAdmin()) {
+        toast('🔒 Apenas admin acessa a auditoria');
+        return;
+    }
     resetarFormularios();
     document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
     document.getElementById(tela).classList.add('active');
@@ -704,14 +937,25 @@ function navegar(tela) {
     const titulos={
         'dashboard':'Controle de Vendas','nova-venda':'Nova Venda',
         'pagamentos':'Pagamentos / Descontos','relatorios':'Ficha do Cliente',
-        'fichas-arquivadas':'Histórico Arquivado','cad-cliente':'Clientes','cad-produto':'Produtos'
+        'fichas-arquivadas':'Histórico Arquivado','cad-cliente':'Clientes','cad-produto':'Produtos',
+        'auditoria':'Auditoria do Sistema'
     };
     document.getElementById('titulo-tela').innerText=titulos[tela]||tela;
     popularSelects();
+    aplicarPermissoes();
     if(tela==='dashboard')   { atualizarHome(); renderGrafico(); }
     if(tela==='cad-cliente') { renderListaClientes(); atualizarBadgeCodCliente(); }
     if(tela==='cad-produto') { renderListaProdutos(); atualizarBadgeCodProduto(); }
+    if(tela==='relatorios')  { renderListaFichas(); }
+    if(tela==='auditoria')   { carregarAuditoria(); }
 }
+
+// Fecha listas de busca (Nova Venda) ao clicar fora
+document.addEventListener('click', e => {
+    if (!e.target.closest('.form-group')) {
+        document.querySelectorAll('.busca-lista').forEach(l => l.style.display='none');
+    }
+});
 
 function resetarFormularios() {
     document.querySelectorAll('input:not([type=hidden])').forEach(i=>i.value='');
@@ -721,14 +965,13 @@ function resetarFormularios() {
     ['venda-cliente-lista','venda-produto-lista'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none';});
     ['venda-cliente-busca','venda-produto-busca'].forEach(id=>{const el=document.getElementById(id);if(el){el.value='';el.placeholder=id.includes('cliente')?'Digite para buscar cliente...':'Digite para buscar produto...';}});
     document.querySelectorAll('select').forEach(s=>s.selectedIndex=0);
-    ['lista-venda-temp','area-impressao','lista-pastas-fechadas','conteudo-ficha-fechada'].forEach(id=>{
+    ['lista-venda-temp','area-impressao','lista-pastas-fechadas','conteudo-ficha-fechada','lista-fichas'].forEach(id=>{
         const el=document.getElementById(id);if(el)el.innerHTML='';
     });
     const tb=document.getElementById('venda-total-bar');if(tb)tb.style.display='none';
     const tl=document.getElementById('venda-total-label');if(tl)tl.innerText='0,00';
     const bp=document.getElementById('box-info-pag');if(bp)bp.style.display='none';
     const bd=document.getElementById('box-info-desc');if(bd)bd.style.display='none'; const bf=document.getElementById('box-info-fin');if(bf)bf.style.display='none';
-    const rb=document.getElementById('rel-busca-lista');if(rb)rb.style.display='none';
     itensAtuais=[];
     cancelarEdicaoCliente(); cancelarEdicaoProduto();
     // Reset pag tabs
@@ -1002,49 +1245,99 @@ async function registrarDesconto() {
 }
 
 /* ══════════════════════════════════════
-   FICHAS — busca por texto
+   FICHAS — lista alfabética + busca
 ══════════════════════════════════════ */
-function filtrarClientesFicha() {
-    const termo = document.getElementById('rel-busca-input').value.toLowerCase().trim();
-    const lista  = document.getElementById('rel-busca-lista');
-    if (!termo) { lista.style.display='none'; return; }
-    const filtrado = db().clientes.filter(c =>
-        c.nome.toLowerCase().includes(termo) || (c.cod||'').toLowerCase().includes(termo)
-    ).slice(0, 12);
-    lista.style.display = 'block';
-    if (filtrado.length === 0) {
-        lista.innerHTML = '<div class="rel-busca-lista-vazio">Nenhum cliente encontrado</div>';
+function renderListaFichas() {
+    const cont = document.getElementById('lista-fichas');
+    const tituloEl = document.getElementById('lista-fichas-titulo');
+    if (!cont) return;
+
+    const inp = document.getElementById('rel-busca-input');
+    const termo = inp ? inp.value.toLowerCase().trim() : '';
+    const cidSel = document.getElementById('rel-cliente').value;
+
+    // Calcula saldo de todos e marca quem tem ficha em aberto.
+    // "Em aberto" = cliente com saldo diferente de zero (devendo ou com crédito).
+    // Clientes quitados (saldo = 0) NÃO aparecem na lista padrão — só via busca.
+    const TOL = 0.005;
+    const todos = db().clientes.map(c => {
+        const saldo = obterSaldo(c._id);
+        return {
+            c,
+            saldo,
+            emAberto: Math.abs(saldo.devido) > TOL
+        };
+    }).sort((a, b) => a.c.nome.localeCompare(b.c.nome, 'pt-BR'));
+
+    let lista;
+    if (termo) {
+        // Busca digitada: inclui TODOS os clientes (com ou sem ficha aberta)
+        // para permitir conferência de qualquer um.
+        lista = todos.filter(x =>
+            x.c.nome.toLowerCase().includes(termo) ||
+            (x.c.cod || '').toLowerCase().includes(termo)
+        );
+    } else {
+        // Sem busca: apenas clientes com ficha em aberto (saldo ≠ 0).
+        lista = todos.filter(x => x.emAberto);
+    }
+
+    tituloEl.innerText = termo
+        ? `Resultados da busca (${lista.length})`
+        : `Fichas em Aberto (${lista.length})`;
+
+    if (lista.length === 0) {
+        cont.innerHTML = termo
+            ? `<div class="empty-state"><div class="icon">🔎</div><p>Nenhum cliente encontrado.</p></div>`
+            : `<div class="empty-state"><div class="icon">✅</div><p>Nenhuma ficha em aberto no momento.</p><p style="margin-top:6px;font-size:0.8rem;">Use a busca acima para localizar qualquer cliente cadastrado.</p></div>`;
         return;
     }
-    lista.innerHTML = filtrado.map(c =>
-        `<div class="rel-busca-lista-item" onclick="selecionarClienteFichaBusca('${c._id}','${c.nome.replace(/'/g,"&#39;")}')">
-            ${c.nome}${c.cod?' <span style="color:#94a3b8;font-size:0.75rem;">('+c.cod+')</span>':''}
-        </div>`
-    ).join('');
+
+    cont.innerHTML = lista.map(x => {
+        const s = x.saldo;
+        let classeSaldo, rotuloSaldo, valorExibido;
+        if (!x.emAberto) {
+            // Cliente quitado (só aparece via busca)
+            classeSaldo = 'saldo-quitado';
+            rotuloSaldo = 'Quitado';
+            valorExibido = 'R$ 0,00';
+        } else if (s.devido > TOL) {
+            classeSaldo = 'saldo-devedor';
+            rotuloSaldo = 'Devendo';
+            valorExibido = 'R$ ' + fmtR(s.devido);
+        } else {
+            classeSaldo = 'saldo-credito';
+            rotuloSaldo = 'Crédito';
+            valorExibido = 'R$ ' + fmtR(Math.abs(s.devido));
+        }
+        const selecionado = (cidSel == x.c._id) ? ' selecionado' : '';
+        const semFicha = !x.emAberto ? ' sem-ficha' : '';
+        const subtitulo = x.emAberto
+            ? `Cód: ${x.c.cod || '—'} · Vendas: R$ ${fmtR(s.totalVendas)} · Pagos: R$ ${fmtR(s.totalPagos)}`
+            : `Cód: ${x.c.cod || '—'} · Tel: ${x.c.tel || '—'} · Ficha quitada`;
+        return `<div class="item-ficha${selecionado}${semFicha}" onclick="selecionarFicha('${x.c._id}')">
+            <div class="item-ficha-info">
+                <strong>${x.c.nome}</strong>
+                <small>${subtitulo}</small>
+            </div>
+            <div class="item-ficha-saldo ${classeSaldo}">
+                <div style="font-size:0.66rem;text-transform:uppercase;letter-spacing:0.04em;opacity:0.7;font-weight:600;">${rotuloSaldo}</div>
+                <div>${valorExibido}</div>
+            </div>
+        </div>`;
+    }).join('');
 }
 
-function selecionarClienteFichaBusca(cid, nome) {
-    document.getElementById('rel-busca-input').value = nome;
-    document.getElementById('rel-busca-lista').style.display = 'none';
+function selecionarFicha(cid) {
     document.getElementById('rel-cliente').value = cid;
+    renderListaFichas();
     exibirFichaCliente();
+    // Rola até a ficha
+    setTimeout(() => {
+        const area = document.getElementById('area-impressao');
+        if (area) area.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
 }
-
-function selecionarClienteFichaSelect() {
-    document.getElementById('rel-busca-input').value = '';
-    document.getElementById('rel-busca-lista').style.display = 'none';
-    exibirFichaCliente();
-}
-
-document.addEventListener('click', e => {
-    if (!e.target.closest('#relatorios .card')) {
-        const l = document.getElementById('rel-busca-lista');
-        if (l) l.style.display = 'none';
-    }
-    if (!e.target.closest('.form-group')) {
-        document.querySelectorAll('.busca-lista').forEach(l => l.style.display='none');
-    }
-});
 
 /* ══════════════════════════════════════
    FICHAS
@@ -1091,8 +1384,8 @@ function exibirFichaCliente() {
     </div>`;
     h+=`<div class="ficha-acoes" style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
         <button class="btn-secondary" style="flex:1;font-size:0.85rem;" onclick="gerarPDF('${cid}')">🖨️ Gerar PDF</button>
-        <button class="btn-secondary" style="flex:1;font-size:0.85rem;background:#eff6ff;color:#1d4ed8;border-color:#bfdbfe;" onclick="abrirModalEdicao('${cid}')">✏️ Editar Lançamentos</button>
-        <button class="btn-secondary btn-success-full" style="flex:1;font-size:0.85rem;" onclick="arquivar('${cid}')">📁 Arquivar Ficha</button>
+        ${ehAdmin() ? `<button class="btn-secondary" style="flex:1;font-size:0.85rem;background:#eff6ff;color:#1d4ed8;border-color:#bfdbfe;" onclick="abrirModalEdicao('${cid}')">✏️ Editar Lançamentos</button>
+        <button class="btn-secondary btn-success-full" style="flex:1;font-size:0.85rem;" onclick="arquivar('${cid}')">📁 Arquivar Ficha</button>` : ''}
     </div>`;
     area.innerHTML=h;
 }
@@ -1308,8 +1601,10 @@ function gerarPDF(cid) {
    ARQUIVAR
 ══════════════════════════════════════ */
 async function arquivar(cid) {
+    if (!exigirAdmin()) return;
+    const cli = db().clientes.find(c=>c._id==cid);
     const s=obterSaldo(cid);
-    const msg=s.devido>0?`Atenção: ainda há R$ ${fmtR(s.devido)} em aberto.\nArquivar mesmo assim?`:'Encerrar e arquivar esta ficha?';
+    const msg=s.devido>0?`Atenção: ainda há R$ ${fmtR(s.devido)} em aberto.\nArquivar mesmo assim a ficha de "${cli?.nome||'cliente'}"?`:`Encerrar e arquivar a ficha de "${cli?.nome||'cliente'}"?`;
     if(!confirm(msg)) return;
     mostrarLoading(true);
     const dataFechamento=new Date().toLocaleString('pt-BR');
@@ -1319,26 +1614,42 @@ async function arquivar(cid) {
     const pagosParaArq=db().pagos.filter(p=>p.cid==cid&&!p.arq);
     const descParaArq=db().descontos.filter(d=>d.cid==cid&&!d.arq);
 
-    for(const v of vendasParaArq){
-        await fs().atualizar('vendas',v._id,{arq:dataFechamento});
-        v.arq=dataFechamento;
+    try {
+        for(const v of vendasParaArq){
+            await fs().atualizar('vendas',v._id,{arq:dataFechamento});
+            v.arq=dataFechamento;
+        }
+        for(const p of pagosParaArq){
+            await fs().atualizar('pagamentos',p._id,{arq:dataFechamento});
+            p.arq=dataFechamento;
+        }
+        for(const d of descParaArq){
+            await fs().atualizar('descontos',d._id,{arq:dataFechamento});
+            d.arq=dataFechamento;
+        }
+        if(credito>0){
+            const pag={cid,data:new Date().toLocaleDateString('pt-BR'),val:credito,forma:'Crédito Ficha Anterior',arq:false};
+            const id=await fs().inserir('pagamentos',pag);
+            db().pagos.push({_id:id,...pag});
+        }
+        // Registra um único evento de "arquivamento" para fácil rastreio
+        await fs().auditar('arquivar', 'clientes', cid, {
+            cliente: cli?.nome,
+            data_fechamento: dataFechamento,
+            saldo_no_fechamento: s.devido,
+            qtd_vendas: vendasParaArq.length,
+            qtd_pagamentos: pagosParaArq.length,
+            qtd_descontos: descParaArq.length
+        });
+        mostrarLoading(false);
+        toast('📁 Ficha arquivada!');
+        document.getElementById('rel-cliente').value = '';
+        exibirFichaCliente();
+        renderListaFichas();
+    } catch(e) {
+        mostrarLoading(false);
+        toast('❌ Erro ao arquivar: ' + (e.message || e));
     }
-    for(const p of pagosParaArq){
-        await fs().atualizar('pagamentos',p._id,{arq:dataFechamento});
-        p.arq=dataFechamento;
-    }
-    for(const d of descParaArq){
-        await fs().atualizar('descontos',d._id,{arq:dataFechamento});
-        d.arq=dataFechamento;
-    }
-    if(credito>0){
-        const pag={cid,data:new Date().toLocaleDateString('pt-BR'),val:credito,forma:'Crédito Ficha Anterior',arq:false};
-        const id=await fs().inserir('pagamentos',pag);
-        db().pagos.push({_id:id,...pag});
-    }
-    mostrarLoading(false);
-    toast('📁 Ficha arquivada!');
-    exibirFichaCliente();
 }
 
 /* ══════════════════════════════════════
@@ -1370,8 +1681,217 @@ function verDetalheArquivado(cid,dataArq) {
         <div class="resumo-linha"><span>Total vendido</span><b class="td-valor">R$ ${fmtR(tV)}</b></div>
         <div class="resumo-linha"><span>Total pago</span><b class="td-valor" style="color:var(--success);">R$ ${fmtR(tP)}</b></div>
         ${tD>0?`<div class="resumo-linha"><span>Descontos</span><b class="td-valor" style="color:#ea580c;">- R$ ${fmtR(tD)}</b></div>`:''}
-    </div></div>`;
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px;">
+        <button class="btn-secondary" style="flex:1;font-size:0.9rem;" onclick="gerarPDFArquivado('${cid}','${dataArq.replace(/'/g,"&#39;")}')">📄 Gerar PDF (com marca BAIXADO)</button>
+    </div>
+    </div>`;
     document.getElementById('conteudo-ficha-fechada').innerHTML=h;
+}
+
+/* ══════════════════════════════════════
+   PDF DE FICHA ARQUIVADA — com marca d'água "BAIXADO"
+══════════════════════════════════════ */
+function _aplicarMarcaDaguaBaixado(doc, pageW, pageH) {
+    // Aplica em todas as páginas do documento
+    const nPags = doc.getNumberOfPages();
+    for (let i = 1; i <= nPags; i++) {
+        doc.setPage(i);
+        const gState = doc.GState ? new doc.GState({ opacity: 0.12 }) : null;
+        if (gState) doc.setGState(gState);
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(110);
+        doc.setTextColor(180, 30, 30);
+        // texto centralizado e rotacionado 45º
+        doc.text('BAIXADO', pageW / 2, pageH / 2, {
+            align: 'center',
+            baseline: 'middle',
+            angle: 45
+        });
+        // restaura opacidade
+        if (gState) {
+            const gOpaco = new doc.GState({ opacity: 1 });
+            doc.setGState(gOpaco);
+        }
+        doc.setTextColor(0, 0, 0);
+    }
+}
+
+function gerarPDFArquivado(cid, dataArq) {
+    if (!window.jspdf) { toast('⚠️ Biblioteca PDF ainda carregando, tente novamente'); return; }
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    const pageW = 210, pageH = 297, mL = 15, mR = 15;
+    let y = 15;
+
+    const cli = db().clientes.find(c => c._id == cid);
+    if (!cli) { toast('⚠️ Cliente não encontrado'); return; }
+
+    // Pega TODO o histórico do cliente daquela ficha arquivada
+    const vds = db().vendas.filter(v => v.cid == cid && v.arq === dataArq);
+    const pgs = db().pagos.filter(p => p.cid == cid && p.arq === dataArq);
+    const dcs = db().descontos.filter(d => d.cid == cid && d.arq === dataArq);
+
+    const tV = vds.reduce((a, v) => a + v.total, 0);
+    const tP = pgs.reduce((a, p) => a + p.val, 0);
+    const tD = dcs.reduce((a, d) => a + d.val, 0);
+
+    const hoje = new Date().toLocaleDateString('pt-BR');
+
+    // Logo
+    try { doc.addImage('data:image/png;base64,' + LOGO_B64, 'PNG', mL, y, 47, 27); } catch (e) { }
+
+    // Dados empresa
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(0, 0, 0);
+    doc.text('Madeireira Tibolla LTDA', pageW - mR, y + 4, { align: 'right' });
+    doc.text('CNPJ: 87.843.173/0001-50', pageW - mR, y + 9, { align: 'right' });
+    doc.text('Estrada Sao Francisco, s/n - Otavio Rocha', pageW - mR, y + 14, { align: 'right' });
+    doc.text('Flores da Cunha - RS', pageW - mR, y + 19, { align: 'right' });
+    y += 26;
+
+    doc.setDrawColor(0, 0, 0); doc.setLineWidth(0.3); doc.line(mL, y, pageW - mR, y); y += 6;
+
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(0, 0, 0);
+    doc.text('FICHA ARQUIVADA - HISTORICO DE COMPRAS', mL, y);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(0, 0, 0);
+    doc.text('Emitida em: ' + hoje, pageW - mR, y, { align: 'right' });
+    y += 5;
+    doc.text('Encerrada em: ' + dataArq, mL, y);
+    y += 6;
+
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(11); doc.setTextColor(0, 0, 0);
+    doc.text(cli.nome, mL, y); y += 5;
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(0, 0, 0);
+    let info = '';
+    if (cli.cod) info += 'Cod: ' + cli.cod + '   ';
+    if (cli.tel) info += 'Tel: ' + cli.tel;
+    if (info) { doc.text(info, mL, y); y += 4; }
+    y += 3;
+
+    // Tabela lançamentos
+    if (vds.length > 0) {
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.setTextColor(0, 0, 0);
+        doc.text('LANÇAMENTOS:', mL, y); y += 2;
+        const linhas = [];
+        vds.forEach(v => v.itens.forEach(i => linhas.push([
+            v.data,
+            String(i.qtd),
+            i.un,
+            i.nome,
+            i.tamanho || '—',
+            i.tipo,
+            'R$ ' + fmtR(i.val),
+            v.retirado,
+            'R$ ' + fmtR(i.total)
+        ])));
+        doc.autoTable({
+            startY: y,
+            head: [['Data', 'Qtd', 'Un', 'Item', 'Tamanho', 'Tipo', 'Preço Unit.', 'Retirado', 'Total']],
+            body: linhas,
+            theme: 'grid',
+            styles: {
+                font: 'helvetica', fontSize: 7, cellPadding: 2,
+                textColor: [0, 0, 0], lineColor: [0, 0, 0], lineWidth: 0.15,
+                overflow: 'linebreak', cellWidth: 'wrap',
+                fillColor: false
+            },
+            headStyles: {
+                fillColor: [255, 255, 255], textColor: [0, 0, 0],
+                fontStyle: 'bold', fontSize: 7,
+                lineColor: [0, 0, 0], lineWidth: 0.3
+            },
+            columnStyles: {
+                0: { cellWidth: 18 },
+                1: { cellWidth: 11 },
+                2: { cellWidth: 8 },
+                3: { cellWidth: 23, overflow: 'linebreak' },
+                4: { cellWidth: 20, overflow: 'linebreak' },
+                5: { cellWidth: 30, overflow: 'linebreak' },
+                6: { cellWidth: 23, halign: 'right' },
+                7: { cellWidth: 23, overflow: 'linebreak' },
+                8: { cellWidth: 24, halign: 'right', fontStyle: 'bold' }
+            },
+            margin: { left: mL, right: mR }
+        });
+        y = doc.lastAutoTable.finalY + 5;
+    }
+
+    // Movimentações financeiras
+    if (pgs.length > 0 || dcs.length > 0) {
+        if (y > pageH - 55) { doc.addPage(); y = 15; }
+        doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.setTextColor(0, 0, 0);
+        doc.text('MOVIMENTAÇÕES FINANCEIRAS:', mL, y); y += 2;
+
+        const movRows = [];
+        pgs.forEach(p => movRows.push({ data: p.data, tipo: 'Pagamento', forma: p.forma || '—', desc: p.descricao || 'Sem descrição', val: p.val, isPag: true }));
+        dcs.forEach(d => movRows.push({ data: d.data, tipo: 'Desconto', forma: '—', desc: d.motivo || 'Sem descrição', val: d.val, isPag: false }));
+        movRows.sort((a, b) => {
+            const pa = a.data.split('/').reverse().join(''), pb = b.data.split('/').reverse().join('');
+            return pa.localeCompare(pb);
+        });
+
+        doc.autoTable({
+            startY: y,
+            head: [['Data', 'Tipo', 'Forma', 'Descrição', 'Valor']],
+            body: movRows.map(m => [
+                m.data,
+                { content: m.tipo, styles: { fontStyle: 'bold', textColor: m.isPag ? [0, 128, 0] : [200, 80, 0] } },
+                m.forma,
+                m.desc,
+                { content: 'R$ ' + fmtR(m.val), styles: { fontStyle: 'bold', halign: 'right', textColor: m.isPag ? [0, 128, 0] : [200, 80, 0] } }
+            ]),
+            theme: 'grid',
+            styles: { font: 'helvetica', fontSize: 7.5, cellPadding: 2, textColor: [0, 0, 0], lineColor: [0, 0, 0], lineWidth: 0.15, overflow: 'linebreak', fillColor: false },
+            headStyles: { fillColor: [255, 255, 255], textColor: [0, 0, 0], fontStyle: 'bold', fontSize: 7.5, lineColor: [0, 0, 0], lineWidth: 0.3 },
+            columnStyles: { 0: { cellWidth: 22 }, 1: { cellWidth: 24 }, 2: { cellWidth: 28 }, 3: { cellWidth: 'auto' }, 4: { cellWidth: 28, halign: 'right' } },
+            margin: { left: mL, right: mR }
+        });
+        y = doc.lastAutoTable.finalY + 5;
+    }
+
+    // Resumo
+    if (y > pageH - 40) { doc.addPage(); y = 15; }
+    doc.setDrawColor(0, 0, 0); doc.line(mL, y, pageW - mR, y); y += 6;
+    doc.setFontSize(10); doc.setTextColor(0, 0, 0);
+    doc.setFont('helvetica', 'normal');
+    doc.text('Total em vendas:', mL, y);
+    doc.setFont('helvetica', 'bold');
+    doc.text('R$ ' + fmtR(tV), pageW - mR, y, { align: 'right' }); y += 6;
+    doc.setFont('helvetica', 'normal');
+    doc.text('(-) Total pago:', mL, y);
+    doc.setFont('helvetica', 'bold');
+    doc.text('- R$ ' + fmtR(tP), pageW - mR, y, { align: 'right' }); y += 6;
+    if (tD > 0) {
+        doc.setFont('helvetica', 'normal');
+        doc.text('(-) Descontos:', mL, y);
+        doc.setFont('helvetica', 'bold');
+        doc.text('- R$ ' + fmtR(tD), pageW - mR, y, { align: 'right' }); y += 6;
+    }
+    doc.setDrawColor(0, 0, 0); doc.line(mL, y, pageW - mR, y); y += 6;
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(12); doc.setTextColor(0, 0, 0);
+    doc.text('SITUAÇÃO: FICHA BAIXADA / ENCERRADA', mL, y);
+    y += 6;
+    doc.setFontSize(10);
+    doc.text('Saldo na data do encerramento:', mL, y);
+    doc.text('R$ ' + fmtR(tV - tP - tD), pageW - mR, y, { align: 'right' });
+
+    // Rodapé
+    const nPags = doc.getNumberOfPages();
+    for (let i = 1; i <= nPags; i++) {
+        doc.setPage(i);
+        doc.setFont('helvetica', 'normal'); doc.setFontSize(7); doc.setTextColor(0, 0, 0);
+        doc.setDrawColor(0, 0, 0); doc.line(mL, pageH - 12, pageW - mR, pageH - 12);
+        doc.text('Madeireira Tibolla LTDA - Documento gerado em ' + hoje, mL, pageH - 7);
+        doc.text('Pagina ' + i + ' de ' + nPags, pageW - mR, pageH - 7, { align: 'right' });
+    }
+
+    // [NOVO] Marca d'água "BAIXADO" no fundo de cada página (aplicada por último para ficar visível)
+    _aplicarMarcaDaguaBaixado(doc, pageW, pageH);
+
+    const dataArqLimpa = dataArq.replace(/[/:\s,]/g, '-');
+    const nomeArq = 'ficha-baixada-' + cli.nome.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') + '-' + dataArqLimpa + '.pdf';
+    doc.save(nomeArq);
+    toast('📄 PDF da ficha arquivada gerado!');
 }
 
 /* ══════════════════════════════════════
@@ -1385,6 +1905,30 @@ async function salvarCliente() {
     if(!cod && !editId) cod = proximoCodigoCliente();
     const tel=document.getElementById('cli-tel').value.trim();
     if(!nome) return toast('⚠️ O nome é obrigatório');
+
+    // [NOVO] Validação anti-duplicidade — nome (case-insensitive, espaços normalizados)
+    const nomeNorm = nome.toLowerCase().replace(/\s+/g, ' ').trim();
+    const duplicadoNome = db().clientes.find(c => {
+        if (editId && c._id == editId) return false; // ignora o próprio na edição
+        const cn = (c.nome || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        return cn === nomeNorm;
+    });
+    if (duplicadoNome) {
+        return toast('⚠️ Já existe um cliente com este nome (Cód: ' + (duplicadoNome.cod || '—') + ')', 3500);
+    }
+
+    // [NOVO] Validação anti-duplicidade — código
+    if (cod) {
+        const codNorm = cod.toLowerCase().trim();
+        const duplicadoCod = db().clientes.find(c => {
+            if (editId && c._id == editId) return false;
+            return (c.cod || '').toLowerCase().trim() === codNorm;
+        });
+        if (duplicadoCod) {
+            return toast('⚠️ Já existe um cliente com este código: ' + duplicadoCod.nome, 3500);
+        }
+    }
+
     mostrarLoading(true);
     if(editId){
         await fs().atualizar('clientes',editId,{nome,cod,tel});
@@ -1415,15 +1959,29 @@ function editarCliente(id){
     document.getElementById('form-cliente').scrollIntoView({behavior:'smooth'});
 }
 async function excluirCliente(id){
+    if (!exigirAdmin()) return;
+    const c = db().clientes.find(x => x._id == id);
+    if (!c) return;
     const temVenda=db().vendas.some(v=>v.cid==id);
-    if(!confirm(temVenda?'Este cliente tem vendas registradas. Excluir mesmo assim?':'Excluir este cliente?')) return;
+    const aviso = temVenda
+        ? `Cliente "${c.nome}" tem vendas registradas.\nDeseja realmente cancelar (inativar)?\nO histórico permanece preservado.`
+        : `Cancelar (inativar) o cliente "${c.nome}"?`;
+    if(!confirm(aviso)) return;
+    const motivo = prompt('Motivo (obrigatório para auditoria):', '');
+    if (motivo === null) return;
+    if (!motivo.trim()) { toast('⚠️ Motivo obrigatório'); return; }
     mostrarLoading(true);
-    await fs().excluir('clientes',id);
-    window._db.clientes=db().clientes.filter(c=>c._id!=id);
-    mostrarLoading(false);
-    renderListaClientes();
-    atualizarBadgeCodCliente();
-    toast('🗑️ Cliente excluído');
+    try {
+        await fs().cancelar('clientes', id, motivo.trim());
+        window._db.clientes = db().clientes.filter(c=>c._id!=id);
+        mostrarLoading(false);
+        renderListaClientes();
+        atualizarBadgeCodCliente();
+        toast('🗑️ Cliente inativado');
+    } catch(e) {
+        mostrarLoading(false);
+        toast('❌ Erro ao inativar: ' + (e.message || e));
+    }
 }
 function cancelarEdicaoCliente(){
     const el=document.getElementById('cli-id-edit');if(el)el.value='';
@@ -1436,9 +1994,13 @@ function renderListaClientes(){
     const cont=document.getElementById('lista-clientes');
     const lista=db().clientes.filter(c=>c.nome.toLowerCase().includes(busca)||(c.cod||'').includes(busca)).sort((a,b)=>a.nome.localeCompare(b.nome));
     if(lista.length===0){cont.innerHTML=`<div class="empty-state"><div class="icon">👥</div><p>Nenhum cliente encontrado.</p></div>`;return;}
+    const podeExcluir = ehAdmin();
     cont.innerHTML=lista.map(c=>{
         const s=obterSaldo(c._id);
-        return `<div class="item-cadastro"><div class="item-cadastro-info"><strong>${c.nome}</strong><small>Cód: ${c.cod||'—'} &nbsp;|&nbsp; Tel: ${c.tel||'—'} &nbsp;|&nbsp; <span style="color:${s.devido>0?'var(--danger)':'var(--success)'};">Saldo: R$ ${fmtR(s.devido)}</span></small></div><div style="display:flex;gap:6px;"><button class="btn-icon" onclick="editarCliente('${c._id}')">✏️</button><button class="btn-icon" onclick="excluirCliente('${c._id}')">🗑️</button></div></div>`;
+        const btnExcluir = podeExcluir
+            ? `<button class="btn-icon" onclick="excluirCliente('${c._id}')" title="Inativar">🗑️</button>`
+            : '';
+        return `<div class="item-cadastro"><div class="item-cadastro-info"><strong>${c.nome}</strong><small>Cód: ${c.cod||'—'} &nbsp;|&nbsp; Tel: ${c.tel||'—'} &nbsp;|&nbsp; <span style="color:${s.devido>0?'var(--danger)':'var(--success)'};">Saldo: R$ ${fmtR(s.devido)}</span></small></div><div style="display:flex;gap:6px;"><button class="btn-icon" onclick="editarCliente('${c._id}')" title="Editar">✏️</button>${btnExcluir}</div></div>`;
     }).join('');
 }
 
@@ -1481,14 +2043,25 @@ function editarProduto(id){
     document.getElementById('form-produto').scrollIntoView({behavior:'smooth'});
 }
 async function excluirProduto(id){
-    if(!confirm('Excluir este produto?')) return;
+    if (!exigirAdmin()) return;
+    const p = db().produtos.find(x => x._id == id);
+    if (!p) return;
+    if(!confirm(`Cancelar (inativar) o produto "${p.nome}"?\nO histórico em vendas é preservado.`)) return;
+    const motivo = prompt('Motivo (obrigatório para auditoria):', '');
+    if (motivo === null) return;
+    if (!motivo.trim()) { toast('⚠️ Motivo obrigatório'); return; }
     mostrarLoading(true);
-    await fs().excluir('produtos',id);
-    window._db.produtos=db().produtos.filter(p=>p._id!=id);
-    mostrarLoading(false);
-    renderListaProdutos();
-    atualizarBadgeCodProduto();
-    toast('🗑️ Produto excluído');
+    try {
+        await fs().cancelar('produtos', id, motivo.trim());
+        window._db.produtos=db().produtos.filter(p=>p._id!=id);
+        mostrarLoading(false);
+        renderListaProdutos();
+        atualizarBadgeCodProduto();
+        toast('🗑️ Produto inativado');
+    } catch(e) {
+        mostrarLoading(false);
+        toast('❌ Erro ao inativar: ' + (e.message || e));
+    }
 }
 function cancelarEdicaoProduto(){
     const el=document.getElementById('prod-id-edit');if(el)el.value='';
@@ -1501,7 +2074,13 @@ function renderListaProdutos(){
     const cont=document.getElementById('lista-produtos');
     const lista=db().produtos.filter(p=>p.nome.toLowerCase().includes(busca)||(p.cod||'').includes(busca)).sort((a,b)=>a.nome.localeCompare(b.nome));
     if(lista.length===0){cont.innerHTML=`<div class="empty-state"><div class="icon">📦</div><p>Nenhum produto encontrado.</p></div>`;return;}
-    cont.innerHTML=lista.map(p=>`<div class="item-cadastro"><div class="item-cadastro-info"><strong>${p.nome}</strong><small>Cód: ${p.cod||'—'}</small></div><div style="display:flex;gap:6px;"><button class="btn-icon" onclick="editarProduto('${p._id}')">✏️</button><button class="btn-icon" onclick="excluirProduto('${p._id}')">🗑️</button></div></div>`).join('');
+    const podeExcluir = ehAdmin();
+    cont.innerHTML=lista.map(p=>{
+        const btnExcluir = podeExcluir
+            ? `<button class="btn-icon" onclick="excluirProduto('${p._id}')" title="Inativar">🗑️</button>`
+            : '';
+        return `<div class="item-cadastro"><div class="item-cadastro-info"><strong>${p.nome}</strong><small>Cód: ${p.cod||'—'}</small></div><div style="display:flex;gap:6px;"><button class="btn-icon" onclick="editarProduto('${p._id}')" title="Editar">✏️</button>${btnExcluir}</div></div>`;
+    }).join('');
 }
 
 /* ══════════════════════════════════════
@@ -1568,36 +2147,113 @@ async function importarDados(event) {
 }
 
 /* ══════════════════════════════════════
-   EDIÇÃO DE LANÇAMENTOS COM SENHA
+   AUDITORIA
 ══════════════════════════════════════ */
-let _cidEdicao = null;
-let _cbDepoisSenha = null;
+window._audCache = null; // últimos registros carregados do Firestore
 
-function abrirModalEdicao(cid) {
-    _cidEdicao = cid;
-    _cbDepoisSenha = () => _abrirEdicaoReal(cid);
-    document.getElementById('senha-input').value = '';
-    document.getElementById('senha-erro').style.display = 'none';
-    document.getElementById('modal-senha').classList.add('open');
-    setTimeout(() => document.getElementById('senha-input').focus(), 300);
-}
-
-function confirmarSenhaEdicao() {
-    const user  = sessionStorage.getItem('usuario') || '';
-    const senha = document.getElementById('senha-input').value;
-    if (USUARIOS[user] && USUARIOS[user] === senha) {
-        fecharModalSenha();
-        if (_cbDepoisSenha) _cbDepoisSenha();
-    } else {
-        document.getElementById('senha-erro').style.display = 'block';
-        document.getElementById('senha-input').value = '';
+async function carregarAuditoria() {
+    if (!ehAdmin()) { toast('🔒 Apenas admin pode ver a auditoria'); navegar('dashboard'); return; }
+    mostrarLoading(true);
+    try {
+        const arr = await fs().listar('auditoria');
+        // Ordena por timestamp desc (servidor pode estar null em alguns)
+        arr.sort((a, b) => {
+            const ta = a.timestamp?.seconds || 0;
+            const tb = b.timestamp?.seconds || 0;
+            return tb - ta;
+        });
+        window._audCache = arr;
+        mostrarLoading(false);
+        renderAuditoria();
+    } catch(e) {
+        mostrarLoading(false);
+        toast('❌ Erro ao carregar auditoria');
+        console.warn(e);
     }
 }
 
-function fecharModalSenha() {
-    document.getElementById('modal-senha').classList.remove('open');
-    document.getElementById('senha-input').value = '';
-    document.getElementById('senha-erro').style.display = 'none';
+function renderAuditoria() {
+    const cont = document.getElementById('lista-auditoria');
+    const resumo = document.getElementById('aud-resumo');
+    if (!cont) return;
+    if (!window._audCache) {
+        cont.innerHTML = '<div class="empty-state"><div class="icon">🔍</div><p>Clique em "Recarregar" para buscar os registros.</p></div>';
+        resumo.innerText = '';
+        return;
+    }
+    const fAcao    = document.getElementById('aud-acao').value;
+    const fColecao = document.getElementById('aud-colecao').value;
+    const fUsuario = (document.getElementById('aud-usuario').value || '').toLowerCase().trim();
+
+    let lista = window._audCache.filter(r => {
+        if (fAcao && r.acao !== fAcao) return false;
+        if (fColecao && r.colecao !== fColecao) return false;
+        if (fUsuario) {
+            const blob = ((r.usuario_email||'') + ' ' + (r.usuario_nome||'')).toLowerCase();
+            if (!blob.includes(fUsuario)) return false;
+        }
+        return true;
+    });
+
+    resumo.innerText = `${lista.length} registro(s) encontrado(s)`;
+
+    if (lista.length === 0) {
+        cont.innerHTML = '<div class="empty-state"><div class="icon">🔎</div><p>Nenhum registro com esses filtros.</p></div>';
+        return;
+    }
+
+    // Limita a 500 itens em tela pra não travar
+    const limit = 500;
+    const exibir = lista.slice(0, limit);
+    if (lista.length > limit) {
+        resumo.innerText += ` (mostrando os ${limit} mais recentes)`;
+    }
+
+    const corAcao = {
+        'criar':          '#10b981',
+        'atualizar':      '#0ea5e9',
+        'cancelar':       '#ef4444',
+        'cancelar_item':  '#ef4444',
+        'excluir_fisico': '#7f1d1d',
+        'arquivar':       '#7c3aed',
+        'login':          '#64748b',
+        'logout':         '#64748b'
+    };
+
+    cont.innerHTML = exibir.map(r => {
+        const dt = r.timestamp?.seconds
+            ? new Date(r.timestamp.seconds * 1000).toLocaleString('pt-BR')
+            : '—';
+        const cor = corAcao[r.acao] || '#64748b';
+        const dadosStr = r.dados ? JSON.stringify(r.dados, null, 0) : '';
+        return `<div class="aud-item">
+            <div class="aud-item-header">
+                <span class="aud-tag" style="background:${cor}">${r.acao}</span>
+                <span class="aud-colecao">${r.colecao || '—'}</span>
+                <span class="aud-data">${dt}</span>
+            </div>
+            <div class="aud-usuario">👤 ${r.usuario_nome || r.usuario_email || 'sistema'}</div>
+            <div class="aud-doc">📄 ${r.colecao || ''}/${r.doc_id || '—'}</div>
+            ${dadosStr && dadosStr !== '{}' ? `<details class="aud-dados"><summary>ver detalhes</summary><pre>${escapeHTML(dadosStr)}</pre></details>` : ''}
+        </div>`;
+    }).join('');
+}
+
+function escapeHTML(s) {
+    return String(s || '').replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+    }[c]));
+}
+
+/* ══════════════════════════════════════
+   EDIÇÃO DE LANÇAMENTOS (admin direto)
+══════════════════════════════════════ */
+let _cidEdicao = null;
+
+function abrirModalEdicao(cid) {
+    if (!exigirAdmin()) return;
+    _cidEdicao = cid;
+    _abrirEdicaoReal(cid);
 }
 
 function _abrirEdicaoReal(cid) {
@@ -1644,20 +2300,42 @@ function _abrirEdicaoReal(cid) {
 }
 
 async function excluirItemEdicao(vid, itemIdx) {
-    if (!confirm('Excluir este item?')) return;
+    if (!exigirAdmin()) return;
     const venda = db().vendas.find(v => v._id === vid);
     if (!venda) return;
-    venda.itens.splice(itemIdx, 1);
-    if (venda.itens.length === 0) {
-        await fs().excluir('vendas', vid);
-        window._db.vendas = db().vendas.filter(v => v._id !== vid);
-    } else {
-        venda.total = venda.itens.reduce((a, b) => a + b.total, 0);
-        await fs().atualizar('vendas', vid, { itens: venda.itens, total: venda.total });
+    const item = venda.itens[itemIdx];
+    if (!item) return;
+    const conf = confirm(`Cancelar este item?\n${item.qtd}${item.un} × ${item.nome}\nValor: R$ ${fmtR(item.total)}\n\nO histórico fica registrado na auditoria.`);
+    if (!conf) return;
+    const motivo = prompt('Motivo (obrigatório para auditoria):', '');
+    if (motivo === null) return;
+    if (!motivo.trim()) { toast('⚠️ Motivo obrigatório'); return; }
+    mostrarLoading(true);
+    try {
+        const itensAntigos = [...venda.itens];
+        venda.itens.splice(itemIdx, 1);
+        if (venda.itens.length === 0) {
+            // Toda a venda fica vazia: cancela a venda inteira (soft)
+            await fs().cancelar('vendas', vid, 'Item único cancelado: ' + motivo.trim());
+            window._db.vendas = db().vendas.filter(v => v._id !== vid);
+        } else {
+            venda.total = venda.itens.reduce((a, b) => a + b.total, 0);
+            await fs().atualizar('vendas', vid, { itens: venda.itens, total: venda.total });
+            // Auditar separadamente o motivo do item removido
+            await fs().auditar('cancelar_item', 'vendas', vid, {
+                motivo: motivo.trim(),
+                item_removido: item,
+                itens_antes: itensAntigos
+            });
+        }
+        mostrarLoading(false);
+        fecharModalEdicao();
+        exibirFichaCliente();
+        toast('🗑️ Item cancelado');
+    } catch(e) {
+        mostrarLoading(false);
+        toast('❌ Erro ao cancelar: ' + (e.message || e));
     }
-    fecharModalEdicao();
-    exibirFichaCliente();
-    toast('🗑️ Item excluído');
 }
 
 async function salvarEdicoes() {
