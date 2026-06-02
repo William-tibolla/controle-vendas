@@ -1149,8 +1149,13 @@ function atualizarResumoFinanceiro() {
     document.getElementById('fin-total-pag').innerText='R$ '+fmtR(pag);
     document.getElementById('fin-total-desc').innerText='R$ '+fmtR(desc);
 
-    const saldoFinal=Math.max(0,saldo.devido-pag-desc);
-    document.getElementById('fin-saldo-final').innerText='R$ '+fmtR(saldoFinal);
+    const saldoFinal=saldo.devido-pag-desc;
+    const elSaldo=document.getElementById('fin-saldo-final');
+    if(saldoFinal < -0.005){
+        elSaldo.innerText='Crédito: R$ '+fmtR(Math.abs(saldoFinal));
+    } else {
+        elSaldo.innerText='R$ '+fmtR(Math.max(0,saldoFinal));
+    }
 }
 
 async function salvarMovimentacaoFinanceira() {
@@ -1169,10 +1174,6 @@ async function salvarMovimentacaoFinanceira() {
     }
 
     const saldo=obterSaldo(cid);
-
-    if(Math.round((pagValor+descValor)*100) > Math.round(saldo.devido*100) + 1 && saldo.devido > 0.005){
-        return toast('⚠️ Valor maior que a dívida atual');
-    }
 
     if(pagValor>0 && !pagDesc){
         return toast('⚠️ Descreva o pagamento');
