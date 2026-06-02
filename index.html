@@ -1267,16 +1267,23 @@ function renderListaFichas() {
     const termo = inp ? inp.value.toLowerCase().trim() : '';
     const cidSel = document.getElementById('rel-cliente').value;
 
-    // Calcula saldo de todos e marca quem tem ficha em aberto.
-    // "Em aberto" = cliente com saldo diferente de zero (devendo ou com crédito).
-    // Clientes quitados (saldo = 0) NÃO aparecem na lista padrão — só via busca.
+    // Calcula saldo de todos e marca o estado da ficha.
+    // "Em aberto" = saldo diferente de zero (devendo ou com crédito).
+    // "Ficha ativa" = possui ao menos um lançamento NÃO arquivado.
+    //   Fichas quitadas (saldo = 0) mas ainda ativas (não arquivadas) PERMANECEM
+    //   na lista padrão — só somem quando o usuário clica em "Arquivar".
     const TOL = 0.005;
     const todos = db().clientes.map(c => {
         const saldo = obterSaldo(c._id);
+        const temFichaAtiva =
+            db().vendas.some(v => v.cid == c._id && !v.arq) ||
+            db().pagos.some(p => p.cid == c._id && !p.arq) ||
+            db().descontos.some(d => d.cid == c._id && !d.arq);
         return {
             c,
             saldo,
-            emAberto: Math.abs(saldo.devido) > TOL
+            emAberto: Math.abs(saldo.devido) > TOL,
+            temFichaAtiva
         };
     }).sort((a, b) => a.c.nome.localeCompare(b.c.nome, 'pt-BR'));
 
@@ -1289,18 +1296,19 @@ function renderListaFichas() {
             (x.c.cod || '').toLowerCase().includes(termo)
         );
     } else {
-        // Sem busca: apenas clientes com ficha em aberto (saldo ≠ 0).
-        lista = todos.filter(x => x.emAberto);
+        // Sem busca: clientes com saldo em aberto OU com ficha ativa (não arquivada),
+        // ainda que quitada. Some apenas após arquivar.
+        lista = todos.filter(x => x.emAberto || x.temFichaAtiva);
     }
 
     tituloEl.innerText = termo
         ? `Resultados da busca (${lista.length})`
-        : `Fichas em Aberto (${lista.length})`;
+        : `Fichas Ativas (${lista.length})`;
 
     if (lista.length === 0) {
         cont.innerHTML = termo
             ? `<div class="empty-state"><div class="icon">🔎</div><p>Nenhum cliente encontrado.</p></div>`
-            : `<div class="empty-state"><div class="icon">✅</div><p>Nenhuma ficha em aberto no momento.</p><p style="margin-top:6px;font-size:0.8rem;">Use a busca acima para localizar qualquer cliente cadastrado.</p></div>`;
+            : `<div class="empty-state"><div class="icon">✅</div><p>Nenhuma ficha ativa no momento.</p><p style="margin-top:6px;font-size:0.8rem;">Use a busca acima para localizar qualquer cliente cadastrado.</p></div>`;
         return;
     }
 
@@ -1322,10 +1330,14 @@ function renderListaFichas() {
             valorExibido = 'R$ ' + fmtR(Math.abs(s.devido));
         }
         const selecionado = (cidSel == x.c._id) ? ' selecionado' : '';
-        const semFicha = !x.emAberto ? ' sem-ficha' : '';
-        const subtitulo = x.emAberto
-            ? `Cód: ${x.c.cod || '—'} · Vendas: R$ ${fmtR(s.totalVendas)} · Pagos: R$ ${fmtR(s.totalPagos)}`
-            : `Cód: ${x.c.cod || '—'} · Tel: ${x.c.tel || '—'} · Ficha quitada`;
+        // Apaga visualmente só os quitados SEM ficha ativa (aparecem via busca).
+        const semFicha = (!x.emAberto && !x.temFichaAtiva) ? ' sem-ficha' : '';
+        let subtitulo;
+        if (x.emAberto || x.temFichaAtiva) {
+            subtitulo = `Cód: ${x.c.cod || '—'} · Vendas: R$ ${fmtR(s.totalVendas)} · Pagos: R$ ${fmtR(s.totalPagos)}`;
+        } else {
+            subtitulo = `Cód: ${x.c.cod || '—'} · Tel: ${x.c.tel || '—'} · Ficha quitada`;
+        }
         return `<div class="item-ficha${selecionado}${semFicha}" onclick="selecionarFicha('${x.c._id}')">
             <div class="item-ficha-info">
                 <strong>${x.c.nome}</strong>
