@@ -661,8 +661,11 @@
 
     <!-- FICHAS ARQUIVADAS -->
     <div id="fichas-arquivadas" class="screen">
-        <div class="form-group"><label>Selecione o Cliente</label><select id="sel-arq-cliente" onchange="listarFichasDoCliente()"></select></div>
-        <div id="lista-pastas-fechadas"></div>
+        <input type="hidden" id="sel-arq-cliente" onchange="listarFichasDoCliente()">
+        <div class="search-bar"><input type="text" id="arq-busca-input" placeholder="🔍 Digite o nome do cliente..." oninput="renderListaArquivadas()" autocomplete="off" style="padding-left:14px;"></div>
+        <div class="section-title" id="lista-arq-titulo" style="margin-top:0;">Clientes com Fichas Arquivadas</div>
+        <div id="lista-arq-clientes"></div>
+        <div id="lista-pastas-fechadas" style="margin-top:12px;"></div>
         <div id="conteudo-ficha-fechada" style="margin-top:12px;"></div>
     </div>
 
@@ -947,6 +950,13 @@ function navegar(tela) {
     if(tela==='cad-cliente') { renderListaClientes(); atualizarBadgeCodCliente(); }
     if(tela==='cad-produto') { renderListaProdutos(); atualizarBadgeCodProduto(); }
     if(tela==='relatorios')  { renderListaFichas(); }
+    if(tela==='fichas-arquivadas') {
+        document.getElementById('sel-arq-cliente').value='';
+        const ab=document.getElementById('arq-busca-input'); if(ab) ab.value='';
+        document.getElementById('lista-pastas-fechadas').innerHTML='';
+        document.getElementById('conteudo-ficha-fechada').innerHTML='';
+        renderListaArquivadas();
+    }
     if(tela==='auditoria')   { carregarAuditoria(); }
 }
 
@@ -993,7 +1003,7 @@ function switchPagTab(panelId, el) {
    SELECTS
 ══════════════════════════════════════ */
 function popularSelects() {
-    ['venda-cliente','fin-cliente','rel-cliente','sel-arq-cliente'].forEach(id=>{
+    ['venda-cliente','fin-cliente','rel-cliente'].forEach(id=>{
         const el=document.getElementById(id);if(!el)return;
         el.innerHTML='<option value="">— Selecione o Cliente —</option>';
         [...db().clientes].sort((a,b)=>a.nome.localeCompare(b.nome)).forEach(c=>el.innerHTML+=`<option value="${c._id}">${c.nome}</option>`);
@@ -1655,6 +1665,64 @@ async function arquivar(cid) {
 /* ══════════════════════════════════════
    FICHAS ARQUIVADAS
 ══════════════════════════════════════ */
+function renderListaArquivadas() {
+    const cont = document.getElementById('lista-arq-clientes');
+    const tituloEl = document.getElementById('lista-arq-titulo');
+    if (!cont) return;
+    const inp = document.getElementById('arq-busca-input');
+    const termo = inp ? inp.value.toLowerCase().trim() : '';
+    const cidSel = document.getElementById('sel-arq-cliente').value;
+
+    // Conjunto de clientes que possuem ao menos uma ficha arquivada
+    const idsComArquivo = new Set(db().vendas.filter(v => v.arq).map(v => v.cid));
+    let lista = db().clientes
+        .filter(c => idsComArquivo.has(c._id))
+        .sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+
+    if (termo) {
+        lista = lista.filter(c =>
+            c.nome.toLowerCase().includes(termo) ||
+            (c.cod || '').toLowerCase().includes(termo)
+        );
+    }
+
+    tituloEl.innerText = termo
+        ? `Resultados da busca (${lista.length})`
+        : `Clientes com Fichas Arquivadas (${lista.length})`;
+
+    if (lista.length === 0) {
+        cont.innerHTML = termo
+            ? `<div class="empty-state"><div class="icon">🔎</div><p>Nenhum cliente encontrado.</p></div>`
+            : `<div class="empty-state"><div class="icon">🗄️</div><p>Nenhuma ficha arquivada ainda.</p></div>`;
+        return;
+    }
+
+    cont.innerHTML = lista.map(c => {
+        const nArq = new Set(db().vendas.filter(v => v.cid == c._id && v.arq).map(v => v.arq)).size;
+        const selecionado = (cidSel == c._id) ? ' selecionado' : '';
+        return `<div class="item-ficha${selecionado}" onclick="selecionarArquivado('${c._id}')">
+            <div class="item-ficha-info">
+                <strong>${c.nome}</strong>
+                <small>Cód: ${c.cod || '—'} · Tel: ${c.tel || '—'}</small>
+            </div>
+            <div class="item-ficha-saldo saldo-quitado">
+                <div style="font-size:0.66rem;text-transform:uppercase;letter-spacing:0.04em;opacity:0.7;font-weight:600;">Arquivadas</div>
+                <div>${nArq}</div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function selecionarArquivado(cid) {
+    document.getElementById('sel-arq-cliente').value = cid;
+    renderListaArquivadas();
+    listarFichasDoCliente();
+    setTimeout(() => {
+        const el = document.getElementById('lista-pastas-fechadas');
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
+}
+
 function listarFichasDoCliente() {
     const cid=document.getElementById('sel-arq-cliente').value;
     const lista=document.getElementById('lista-pastas-fechadas');
