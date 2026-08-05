@@ -78,6 +78,85 @@
         await auditar('cancelar', nome, id, { motivo });
     }
 
+    // Arquiva a ficha inteira num ÚNICO commit: ou tudo entra, ou nada entra.
+    // O caminho antigo gravava documento por documento; uma queda de rede no meio
+    // deixava a ficha metade arquivada e o saldo do cliente errado.
+    async function arquivarLote({ cid, dataFechamento, vendas, pagamentos, descontos, credito, dadosAuditoria }) {
+        const nOps = vendas.length + pagamentos.length + descontos.length
+                   + (credito > 0 ? 1 : 0) + 1; // +1 = registro de auditoria
+        // Um writeBatch do Firestore aceita no máximo 500 operações. A maior ficha
+        // real hoje tem 12 lançamentos, mas é melhor recusar com uma mensagem clara
+        // do que estourar o limite no meio da gravação.
+        if (nOps > 450) {
+            throw new Error(`Ficha grande demais para arquivar de uma vez (${nOps} operações).`);
+        }
+
+        const batch = writeBatch(db);
+        const autor = {
+            uid:   window._usuario?.uid   || null,
+            email: window._usuario?.email || null,
+            nome:  window._usuario?.nome  || null
+        };
+        const carimbo = {
+            arq: dataFechamento,
+            atualizado_em:        serverTimestamp(),
+            atualizado_por_uid:   autor.uid,
+            atualizado_por_email: autor.email,
+            atualizado_por_nome:  autor.nome
+        };
+
+        for (const [nome, ids] of [['vendas', vendas], ['pagamentos', pagamentos], ['descontos', descontos]]) {
+            for (const id of ids) batch.update(doc(db, nome, id), carimbo);
+        }
+
+        // Crédito remanescente vira pagamento na ficha nova. O id é gerado aqui
+        // para já entrar na auditoria e voltar pra memória local.
+        let creditoId = null;
+        let creditoDoc = null;
+        if (credito > 0) {
+            const ref = doc(col('pagamentos'));
+            creditoId = ref.id;
+            creditoDoc = {
+                cid,
+                data:  new Date().toLocaleDateString('pt-BR'),
+                val:   credito,
+                forma: 'Crédito Ficha Anterior',
+                arq:   false
+            };
+            batch.set(ref, {
+                ...creditoDoc,
+                _ts: serverTimestamp(),
+                criado_por_uid:   autor.uid,
+                criado_por_email: autor.email,
+                criado_por_nome:  autor.nome
+            });
+        }
+
+        // A auditoria entra no mesmo commit: rastro de arquivamento não pode
+        // sobreviver a um arquivamento que não aconteceu.
+        batch.set(doc(col('auditoria')), {
+            acao: 'arquivar',
+            colecao: 'clientes',
+            doc_id: cid,
+            dados: {
+                ...dadosAuditoria,
+                credito_gerado:       credito || 0,
+                credito_pagamento_id: creditoId,
+                vendas_ids:     vendas,
+                pagamentos_ids: pagamentos,
+                descontos_ids:  descontos
+            },
+            usuario_uid:   autor.uid,
+            usuario_email: autor.email,
+            usuario_nome:  autor.nome,
+            timestamp: serverTimestamp(),
+            user_agent: navigator.userAgent || null
+        });
+
+        await batch.commit();
+        return { creditoId, creditoDoc };
+    }
+
     // Registra entrada no log de auditoria. Nunca lança erro pra não travar fluxo.
     async function auditar(acao, colecao, doc_id, dados) {
         try {
@@ -148,7 +227,7 @@
     }
 
     window._fs = {
-        listar, inserir, atualizar, excluir, cancelar, auditar,
+        listar, inserir, atualizar, excluir, cancelar, auditar, arquivarLote,
         carregarTudo, fazerLoginAuth, logoutApp, carregarPerfil
     };
 
@@ -251,6 +330,7 @@
         .dashboard-header { background: linear-gradient(135deg, var(--primary) 0%, #3b82f6 100%); border-radius: 16px; padding: 20px; color: white; margin-bottom: 14px; box-shadow: var(--shadow-md); }
         .dashboard-header h2 { font-size: 0.72rem; font-weight: 500; opacity: 0.8; text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 5px; }
         .dashboard-valor { font-size: 2rem; font-weight: 700; font-family: 'DM Mono', monospace; }
+        .dashboard-credito { font-size: 0.74rem; opacity: 0.85; margin-top: 6px; line-height: 1.4; }
         .dashboard-sub { display: flex; gap: 16px; margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,0.2); flex-wrap: wrap; }
         .dashboard-sub span { font-size: 0.78rem; opacity: 0.9; }
         .dashboard-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
@@ -491,6 +571,7 @@
         <div class="dashboard-header">
             <h2>Total a Receber</h2>
             <div class="dashboard-valor">R$ <span id="dash-total">0,00</span></div>
+            <div class="dashboard-credito" id="dash-credito" style="display:none;"></div>
             <div class="dashboard-sub">
                 <span>📦 Vendas: <b id="dash-vendas">R$ 0,00</b></span>
                 <span>✅ Pagos: <b id="dash-pagos">R$ 0,00</b></span>
@@ -1022,10 +1103,30 @@ function atualizarHome() {
     const tv  = db().vendas.filter(v=>!v.arq).reduce((a,b)=>a+b.total,0);
     const tp  = db().pagos.filter(p=>!p.arq).reduce((a,b)=>a+b.val,0);
     const td  = db().descontos.filter(d=>!d.arq).reduce((a,b)=>a+b.val,0);
-    document.getElementById('dash-total').innerText=fmtR(tv-tp-td);
+
+    // Somar tudo de uma vez (tv-tp-td) abatia o crédito de uns clientes da dívida
+    // de outros, e o total a cobrar saía menor do que a soma das fichas.
+    // Dívida e crédito são grandezas diferentes: cada cliente conta separado.
+    const TOL = 0.005;
+    let aReceber = 0, credito = 0, nCredito = 0;
+    for (const c of db().clientes) {
+        const s = obterSaldo(c._id).devido;
+        if (s > TOL) aReceber += s;
+        else if (s < -TOL) { credito += -s; nCredito++; }
+    }
+
+    document.getElementById('dash-total').innerText=fmtR(aReceber);
     document.getElementById('dash-vendas').innerText='R$ '+fmtR(tv);
     document.getElementById('dash-pagos').innerText='R$ '+fmtR(tp);
     document.getElementById('dash-descontos').innerText='R$ '+fmtR(td);
+
+    const elCred = document.getElementById('dash-credito');
+    if (elCred) {
+        elCred.style.display = nCredito ? 'block' : 'none';
+        elCred.innerText = nCredito
+            ? `↳ ${nCredito} cliente${nCredito>1?'s':''} com crédito de R$ ${fmtR(credito)} — não abatido acima`
+            : '';
+    }
 }
 
 /* ══════════════════════════════════════
@@ -1627,43 +1728,45 @@ async function arquivar(cid) {
     if (!exigirAdmin()) return;
     const cli = db().clientes.find(c=>c._id==cid);
     const s=obterSaldo(cid);
-    const msg=s.devido>0?`Atenção: ainda há R$ ${fmtR(s.devido)} em aberto.\nArquivar mesmo assim a ficha de "${cli?.nome||'cliente'}"?`:`Encerrar e arquivar a ficha de "${cli?.nome||'cliente'}"?`;
+    // Meio centavo: abaixo disso é resto de subtração de ponto flutuante, não dinheiro.
+    const TOL = 0.005;
+    const msg=s.devido>TOL?`Atenção: ainda há R$ ${fmtR(s.devido)} em aberto.\nArquivar mesmo assim a ficha de "${cli?.nome||'cliente'}"?`:`Encerrar e arquivar a ficha de "${cli?.nome||'cliente'}"?`;
     if(!confirm(msg)) return;
     mostrarLoading(true);
     const dataFechamento=new Date().toLocaleString('pt-BR');
-    const credito=s.devido<0?Math.abs(s.devido):0;
+    // Sem a tolerância, um saldo de -1e-13 virava "crédito" e gerava um
+    // pagamento de R$ 0,00 no banco.
+    const credito=s.devido<-TOL?Math.abs(s.devido):0;
 
     const vendasParaArq=db().vendas.filter(v=>v.cid==cid&&!v.arq);
     const pagosParaArq=db().pagos.filter(p=>p.cid==cid&&!p.arq);
     const descParaArq=db().descontos.filter(d=>d.cid==cid&&!d.arq);
 
     try {
-        for(const v of vendasParaArq){
-            await fs().atualizar('vendas',v._id,{arq:dataFechamento});
-            v.arq=dataFechamento;
-        }
-        for(const p of pagosParaArq){
-            await fs().atualizar('pagamentos',p._id,{arq:dataFechamento});
-            p.arq=dataFechamento;
-        }
-        for(const d of descParaArq){
-            await fs().atualizar('descontos',d._id,{arq:dataFechamento});
-            d.arq=dataFechamento;
-        }
-        if(credito>0){
-            const pag={cid,data:new Date().toLocaleDateString('pt-BR'),val:credito,forma:'Crédito Ficha Anterior',arq:false};
-            const id=await fs().inserir('pagamentos',pag);
-            db().pagos.push({_id:id,...pag});
-        }
-        // Registra um único evento de "arquivamento" para fácil rastreio
-        await fs().auditar('arquivar', 'clientes', cid, {
-            cliente: cli?.nome,
-            data_fechamento: dataFechamento,
-            saldo_no_fechamento: s.devido,
-            qtd_vendas: vendasParaArq.length,
-            qtd_pagamentos: pagosParaArq.length,
-            qtd_descontos: descParaArq.length
+        // Uma única transação: a ficha nunca fica metade arquivada.
+        const { creditoId, creditoDoc } = await fs().arquivarLote({
+            cid,
+            dataFechamento,
+            vendas:     vendasParaArq.map(v=>v._id),
+            pagamentos: pagosParaArq.map(p=>p._id),
+            descontos:  descParaArq.map(d=>d._id),
+            credito,
+            dadosAuditoria: {
+                cliente: cli?.nome,
+                data_fechamento: dataFechamento,
+                saldo_no_fechamento: s.devido,
+                qtd_vendas: vendasParaArq.length,
+                qtd_pagamentos: pagosParaArq.length,
+                qtd_descontos: descParaArq.length
+            }
         });
+
+        // Só depois do commit confirmado a memória local acompanha o banco.
+        for(const v of vendasParaArq) v.arq=dataFechamento;
+        for(const p of pagosParaArq)  p.arq=dataFechamento;
+        for(const d of descParaArq)   d.arq=dataFechamento;
+        if(creditoId) db().pagos.push({_id:creditoId,...creditoDoc});
+
         mostrarLoading(false);
         toast('📁 Ficha arquivada!');
         document.getElementById('rel-cliente').value = '';
