@@ -933,6 +933,30 @@ function aplicarPermissoes() {
 ══════════════════════════════════════ */
 function fmtR(v) { return (v||0).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2}); }
 
+/* ── Ordenação cronológica ──────────────────────────────────────────
+   O Firestore devolve os documentos sem ordem garantida, por isso as
+   fichas e os PDFs apareciam embaralhados. Ordenamos sempre pela data
+   (dd/mm/aaaa) e, no mesmo dia, pelo _ts do servidor (ordem em que foi
+   lançado). Registro sem data válida vai para o fim, para não sumir. */
+function chaveData(d) {
+    const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(String(d||'').trim());
+    if (!m) return '99999999';
+    return m[3] + m[2].padStart(2,'0') + m[1].padStart(2,'0');
+}
+function chaveTs(r) {
+    const t = r && r._ts;
+    if (!t) return 0;
+    if (typeof t.seconds === 'number') return t.seconds;
+    if (typeof t.toMillis === 'function') return t.toMillis()/1000;
+    return 0;
+}
+function cmpCronologico(a, b) {
+    const ka=chaveData(a.data), kb=chaveData(b.data);
+    if (ka !== kb) return ka < kb ? -1 : 1;
+    return chaveTs(a) - chaveTs(b);
+}
+function ordenarPorData(arr) { return [...arr].sort(cmpCronologico); }
+
 function toast(msg, dur=2500) {
     const t=document.getElementById('toast');
     t.innerText=msg; t.classList.add('show');
@@ -1472,9 +1496,9 @@ function exibirFichaCliente() {
     if(!cid){area.innerHTML='';return;}
     const s=obterSaldo(cid);
     const cli=db().clientes.find(c=>c._id==cid);
-    const vds=db().vendas.filter(v=>v.cid==cid&&!v.arq);
-    const pgs=db().pagos.filter(p=>p.cid==cid&&!p.arq);
-    const dcs=db().descontos.filter(d=>d.cid==cid&&!d.arq);
+    const vds=ordenarPorData(db().vendas.filter(v=>v.cid==cid&&!v.arq));
+    const pgs=ordenarPorData(db().pagos.filter(p=>p.cid==cid&&!p.arq));
+    const dcs=ordenarPorData(db().descontos.filter(d=>d.cid==cid&&!d.arq));
 
     let h=`<div style="padding:10px 0;"><h3 style="margin-bottom:4px;">${cli.nome}</h3><p style="font-size:0.8rem;color:var(--text-muted);margin:0;">Cód: ${cli.cod||'—'} &nbsp;|&nbsp; Tel: ${cli.tel||'—'}</p></div>`;
 
@@ -1570,9 +1594,9 @@ function gerarPDF(cid) {
 
     const cli = db().clientes.find(c => c._id==cid);
     const s   = obterSaldo(cid);
-    const vds = db().vendas.filter(v => v.cid==cid && !v.arq);
-    const pgs = db().pagos.filter(p => p.cid==cid && !p.arq);
-    const dcs = db().descontos.filter(d => d.cid==cid && !d.arq);
+    const vds = ordenarPorData(db().vendas.filter(v => v.cid==cid && !v.arq));
+    const pgs = ordenarPorData(db().pagos.filter(p => p.cid==cid && !p.arq));
+    const dcs = ordenarPorData(db().descontos.filter(d => d.cid==cid && !d.arq));
     const hoje = new Date().toLocaleDateString('pt-BR');
 
     // Logo
@@ -1659,9 +1683,9 @@ function gerarPDF(cid) {
 
         // Monta todas as linhas ordenadas por data
         const movRows=[];
-        pgs.forEach(p=>movRows.push({data:p.data, tipo:'Pagamento', forma:p.forma||'—', desc:p.descricao||'Sem descrição', val:p.val, isPag:true}));
-        dcs.forEach(d=>movRows.push({data:d.data, tipo:'Desconto',  forma:'—',         desc:d.motivo||'Sem descrição',   val:d.val, isPag:false}));
-        movRows.sort((a,b)=>{ const pa=a.data.split('/').reverse().join(''), pb=b.data.split('/').reverse().join(''); return pa.localeCompare(pb); });
+        pgs.forEach(p=>movRows.push({data:p.data, _ts:p._ts, tipo:'Pagamento', forma:p.forma||'—', desc:p.descricao||'Sem descrição', val:p.val, isPag:true}));
+        dcs.forEach(d=>movRows.push({data:d.data, _ts:d._ts, tipo:'Desconto',  forma:'—',         desc:d.motivo||'Sem descrição',   val:d.val, isPag:false}));
+        movRows.sort(cmpCronologico);
 
         doc.autoTable({
             startY:y,
@@ -1850,9 +1874,9 @@ function listarFichasDoCliente() {
         marcacoes.sort((a,b)=>b.localeCompare(a)).map(m=>`<div class="item-pasta" onclick="verDetalheArquivado('${cid}','${m}')"><span>📅 ${m}</span><span style="color:var(--primary);">Ver →</span></div>`).join('');
 }
 function verDetalheArquivado(cid,dataArq) {
-    const vds=db().vendas.filter(v=>v.cid==cid&&v.arq===dataArq);
-    const pgs=db().pagos.filter(p=>p.cid==cid&&p.arq===dataArq);
-    const dcs=db().descontos.filter(d=>d.cid==cid&&d.arq===dataArq);
+    const vds=ordenarPorData(db().vendas.filter(v=>v.cid==cid&&v.arq===dataArq));
+    const pgs=ordenarPorData(db().pagos.filter(p=>p.cid==cid&&p.arq===dataArq));
+    const dcs=ordenarPorData(db().descontos.filter(d=>d.cid==cid&&d.arq===dataArq));
     const tV=vds.reduce((a,v)=>a+v.total,0);
     const tP=pgs.reduce((a,p)=>a+p.val,0);
     const tD=dcs.reduce((a,d)=>a+d.val,0);
@@ -1912,9 +1936,9 @@ function gerarPDFArquivado(cid, dataArq) {
     if (!cli) { toast('⚠️ Cliente não encontrado'); return; }
 
     // Pega TODO o histórico do cliente daquela ficha arquivada
-    const vds = db().vendas.filter(v => v.cid == cid && v.arq === dataArq);
-    const pgs = db().pagos.filter(p => p.cid == cid && p.arq === dataArq);
-    const dcs = db().descontos.filter(d => d.cid == cid && d.arq === dataArq);
+    const vds = ordenarPorData(db().vendas.filter(v => v.cid == cid && v.arq === dataArq));
+    const pgs = ordenarPorData(db().pagos.filter(p => p.cid == cid && p.arq === dataArq));
+    const dcs = ordenarPorData(db().descontos.filter(d => d.cid == cid && d.arq === dataArq));
 
     const tV = vds.reduce((a, v) => a + v.total, 0);
     const tP = pgs.reduce((a, p) => a + p.val, 0);
@@ -2007,12 +2031,9 @@ function gerarPDFArquivado(cid, dataArq) {
         doc.text('MOVIMENTAÇÕES FINANCEIRAS:', mL, y); y += 2;
 
         const movRows = [];
-        pgs.forEach(p => movRows.push({ data: p.data, tipo: 'Pagamento', forma: p.forma || '—', desc: p.descricao || 'Sem descrição', val: p.val, isPag: true }));
-        dcs.forEach(d => movRows.push({ data: d.data, tipo: 'Desconto', forma: '—', desc: d.motivo || 'Sem descrição', val: d.val, isPag: false }));
-        movRows.sort((a, b) => {
-            const pa = a.data.split('/').reverse().join(''), pb = b.data.split('/').reverse().join('');
-            return pa.localeCompare(pb);
-        });
+        pgs.forEach(p => movRows.push({ data: p.data, _ts: p._ts, tipo: 'Pagamento', forma: p.forma || '—', desc: p.descricao || 'Sem descrição', val: p.val, isPag: true }));
+        dcs.forEach(d => movRows.push({ data: d.data, _ts: d._ts, tipo: 'Desconto', forma: '—', desc: d.motivo || 'Sem descrição', val: d.val, isPag: false }));
+        movRows.sort(cmpCronologico);
 
         doc.autoTable({
             startY: y,
@@ -2441,7 +2462,7 @@ function abrirModalEdicao(cid) {
 }
 
 function _abrirEdicaoReal(cid) {
-    const vds = db().vendas.filter(v => v.cid == cid && !v.arq);
+    const vds = ordenarPorData(db().vendas.filter(v => v.cid == cid && !v.arq));
     const corpo = document.getElementById('modal-edicao-corpo');
 
     if (vds.length === 0) {
